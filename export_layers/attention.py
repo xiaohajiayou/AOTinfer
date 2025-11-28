@@ -75,9 +75,8 @@ class ExportAttention(nn.Module):
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if cache_len.item() > 0:
-            k = torch.cat([key_cache, k], dim=2)
-            v = torch.cat([value_cache, v], dim=2)
+        k = torch.cat([key_cache, k], dim=2)
+        v = torch.cat([value_cache, v], dim=2)
         new_cache_len = cache_len + n_step
         new_key_cache = k
         new_value_cache = v
