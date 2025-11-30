@@ -275,9 +275,9 @@ if __name__ == "__main__":
     main(parse_args())
 
 # python -m qwen.run_qwen2_prompt \
-#   --device mps \
+#   --device cpu \
 #   --torch_dtype float16 \
 #   -m /Users/bruceli/Desktop/Git_sync/model/Qwen2-0.5B-Instruct \
-#   --package_path /Users/bruceli/Desktop/Git_sync/model/Qwen2-0.5B-Instruct/aoti_out/qwen2_export.pt2 \
+#   --package_path /Users/bruceli/Desktop/Git_sync/model/pt2/qwen2_export.pt2 \
 #   --compare_hf \
 #   --warmup_decode_steps 3

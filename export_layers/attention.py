@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
 
-from .rotary import apply_rotary_pos_emb
+from .rotary import apply_rotary_pos_emb, rotate_half
 from .utils import repeat_kv
 
 
@@ -15,6 +15,7 @@ class ExportAttentionConfig:
     num_key_value_heads: int
     head_dim: int
     attention_dropout: float = 0.0
+    mrope_section: Optional[List[int]] = None
 
 
 class ExportAttention(nn.Module):
@@ -38,6 +39,7 @@ class ExportAttention(nn.Module):
         self.o_proj = o_proj
         self.scaling = config.head_dim**-0.5
         self.num_groups = config.num_attention_heads // config.num_key_value_heads
+        self.mrope_section = config.mrope_section
 
     def forward(
         self,
@@ -73,7 +75,19 @@ class ExportAttention(nn.Module):
         k = k.view(bsz, n_step, num_kv_heads, head_dim).transpose(1, 2)
         v = v.view(bsz, n_step, num_kv_heads, head_dim).transpose(1, 2)
 
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if self.mrope_section is not None and cos.dim() == 4 and cos.shape[0] == 3:
+            # Multimodal RoPE (Qwen2.5-VL style), cos/sin shape: [3, B, seq, head_dim]
+            mrope_section = [s * 2 for s in self.mrope_section]
+            cos_reordered = torch.cat(
+                [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
+            ).unsqueeze(1)  # [B,1,seq,head_dim]
+            sin_reordered = torch.cat(
+                [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
+            ).unsqueeze(1)
+            q = (q * cos_reordered) + (rotate_half(q) * sin_reordered)
+            k = (k * cos_reordered) + (rotate_half(k) * sin_reordered)
+        else:
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         k = torch.cat([key_cache, k], dim=2)
         v = torch.cat([value_cache, v], dim=2)
