@@ -153,7 +153,7 @@ def parse_args():
     parser.add_argument("--package_name", type=str, default="qwen2_export.pt2")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--torch_dtype", type=str, default="float16")
-    parser.add_argument("--device_index", type=int, default=0)
+    parser.add_argument("--device_index", type=int, default=-1, help="Use -1 for CPU, GPU index for CUDA")
     parser.add_argument("--example_cache_len", type=int, default=16)
     parser.add_argument("--example_seq", type=int, default=4)
     parser.add_argument("--prompt", type=str, default="你好，简单介绍一下你自己。")

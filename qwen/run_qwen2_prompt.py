@@ -1,5 +1,6 @@
 import argparse
 import sys
+import time
 from typing import List, Optional
 
 import torch
@@ -104,24 +105,56 @@ def run_joint_stream(tokenizer, runner, config, dtype, args, hf_runner: Optional
     value_cache = init_cache(0)
     cache_len = torch.tensor(0, dtype=torch.long, device=device)
 
+    # Warmup to amortize compile/cache misses before real timing.
+    if args.warmup_decode_steps > 0:
+        warm_key = init_cache(0)
+        warm_value = init_cache(0)
+        warm_cache_len = torch.tensor(0, dtype=torch.long, device=device)
+        warm_logits, warm_key, warm_value, warm_cache_len = runner.run(
+            generated, warm_key, warm_value, warm_cache_len
+        )
+        warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+        for _ in range(args.warmup_decode_steps):
+            warm_logits, warm_key, warm_value, warm_cache_len = runner.run(
+                warm_next, warm_key, warm_value, warm_cache_len
+            )
+            warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+        if hf_runner:
+            # HF warmup uses its own cache; reset afterward to not affect main run.
+            warm_logits = hf_runner.run(generated)
+            warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+            for _ in range(args.warmup_decode_steps):
+                warm_logits = hf_runner.run(warm_next)
+                warm_next = torch.argmax(warm_logits[:, -1, :], dim=-1, keepdim=True)
+            hf_runner.cache = None
+
+    t0 = time.perf_counter()
     logits, key_cache, value_cache, cache_len = runner.run(
         generated, key_cache, value_cache, cache_len
     )
+    aoti_prefill_ms = (time.perf_counter() - t0) * 1000
     processors = build_logits_processor(args)
-    print("=== Streaming Output (AOTI) ===")
-    full_text = tokenizer.decode(
-        generated[0],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
-    )
-    sys.stdout.write(full_text)
-    sys.stdout.flush()
-    prev_len = len(full_text)
+    # print("=== Streaming Output (AOTI) ===")
+    # full_text = tokenizer.decode(
+    #     generated[0],
+    #     skip_special_tokens=True,
+    #     clean_up_tokenization_spaces=True,
+    # )
+    # sys.stdout.write(full_text)
+    # sys.stdout.flush()
+    # prev_len = len(full_text)
     log_messages: List[str] = []
     hf_logits = None
     if hf_runner:
+        t0 = time.perf_counter()
         hf_logits = hf_runner.run(generated)
+        hf_prefill_ms = (time.perf_counter() - t0) * 1000
         log_messages.append(format_logits_diff(hf_logits[:, -1, :], logits[:, -1, :], "prefill"))
+    else:
+        hf_prefill_ms = None
+
+    aoti_decode_ms: List[float] = []
+    hf_decode_ms: List[float] = []
 
     eos_token_id = tokenizer.eos_token_id
     for step in range(args.max_new_tokens):
@@ -134,22 +167,26 @@ def run_joint_stream(tokenizer, runner, config, dtype, args, hf_runner: Optional
             next_token = torch.multinomial(probs, num_samples=1)
 
         generated = torch.cat([generated, next_token], dim=1)
-        full_text = tokenizer.decode(
-            generated[0],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )
-        sys.stdout.write("\r" + full_text)
-        sys.stdout.write(" " * max(0, prev_len - len(full_text)))
-        sys.stdout.flush()
-        prev_len = len(full_text)
+        # full_text = tokenizer.decode(
+        #     generated[0],
+        #     skip_special_tokens=True,
+        #     clean_up_tokenization_spaces=True,
+        # )
+        # sys.stdout.write("\r" + full_text)
+        # sys.stdout.write(" " * max(0, prev_len - len(full_text)))
+        # sys.stdout.flush()
+        # prev_len = len(full_text)
 
+        t1 = time.perf_counter()
         logits, key_cache, value_cache, cache_len = runner.run(
             next_token, key_cache, value_cache, cache_len
         )
+        aoti_decode_ms.append((time.perf_counter() - t1) * 1000)
         if hf_runner:
             hf_generated = torch.cat([hf_generated, next_token], dim=1)
+            t2 = time.perf_counter()
             hf_logits = hf_runner.run(next_token)
+            hf_decode_ms.append((time.perf_counter() - t2) * 1000)
             log_messages.append(
                 format_logits_diff(hf_logits[:, -1, :], logits[:, -1, :], f"decode-{step}")
             )
@@ -157,7 +194,15 @@ def run_joint_stream(tokenizer, runner, config, dtype, args, hf_runner: Optional
             break
 
     print()
-    sys.stdout.write("\n")
+    # sys.stdout.write("\n")
+    print("=== AOTI Output ===")
+    aoti_text = tokenizer.decode(
+        generated[0],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    print(aoti_text)
+
     if hf_runner:
         print("=== HF Reference ===")
         hf_text = tokenizer.decode(
@@ -166,9 +211,37 @@ def run_joint_stream(tokenizer, runner, config, dtype, args, hf_runner: Optional
             clean_up_tokenization_spaces=True,
         )
         print(hf_text)
-        print("=== HF vs AOTI logits ===")
-        for msg in log_messages:
-            print(msg)
+        # print("=== HF vs AOTI logits ===")
+        # for msg in log_messages:
+        #     print(msg)
+
+    def pct(vals: List[float], q: float):
+        if not vals:
+            return None
+        vals_sorted = sorted(vals)
+        idx = (len(vals_sorted) - 1) * q
+        lo = int(idx)
+        hi = min(lo + 1, len(vals_sorted) - 1)
+        frac = idx - lo
+        return vals_sorted[lo] * (1 - frac) + vals_sorted[hi] * frac
+
+    def print_stats(prefix: str, prefill_ms: float, decode_ms: List[float]):
+        print(f"{prefix} prefill: {prefill_ms:.2f} ms")
+        if decode_ms:
+            avg = sum(decode_ms) / len(decode_ms)
+            total_s = sum(decode_ms) / 1000.0
+            throughput = len(decode_ms) / total_s if total_s > 0 else float("nan")
+            p50 = pct(decode_ms, 0.5)
+            p90 = pct(decode_ms, 0.9)
+            p99 = pct(decode_ms, 0.99)
+            print(
+                f"{prefix} decode avg: {avg:.2f} ms | P50 {p50:.2f} | P90 {p90:.2f} | P99 {p99:.2f} | throughput {throughput:.2f} tok/s"
+            )
+
+    print("=== Latency (ms) ===")
+    print_stats("AOTI", aoti_prefill_ms, aoti_decode_ms)
+    if hf_runner and hf_prefill_ms is not None:
+        print_stats("HF", hf_prefill_ms, hf_decode_ms)
 
 
 def format_logits_diff(logits_hf, logits_aoti, step: str) -> str:
@@ -191,11 +264,20 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--greedy", action="store_true", help="Use greedy decoding instead of sampling")
     parser.add_argument("--package_path", type=str, required=True, help="AOTI package path")
-    parser.add_argument("--device_index", type=int, default=0)
+    parser.add_argument("--device_index", type=int, default=-1, help="Use -1 for CPU, GPU index for CUDA")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compare_hf", action="store_true", help="Compare with HF AutoModel outputs")
+    parser.add_argument("--warmup_decode_steps", type=int, default=2, help="Warmup decode steps before timing")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     main(parse_args())
+
+# python -m qwen.run_qwen2_prompt \
+#   --device mps \
+#   --torch_dtype float16 \
+#   -m /Users/bruceli/Desktop/Git_sync/model/Qwen2-0.5B-Instruct \
+#   --package_path /Users/bruceli/Desktop/Git_sync/model/Qwen2-0.5B-Instruct/aoti_out/qwen2_export.pt2 \
+#   --compare_hf \
+#   --warmup_decode_steps 3

@@ -98,9 +98,10 @@ def report(tensor_a, tensor_b, name):
 
 def parse():
     parser = argparse.ArgumentParser(description="Debug single Qwen2 layer export block")
-    parser.add_argument("-m", "--model_path", type=str, default="/home/cdipc03/models/Qwen/Qwen2-0.5B")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--torch_dtype", type=str, default="float16")
+    # parser.add_argument("-m", "--model_path", type=str, default="/home/cdipc03/models/Qwen/Qwen2-0.5B")
+    parser.add_argument("-m", "--model_path", type=str, default="/Users/bruceli/Desktop/Git_sync/model/Qwen2-0.5B-Instruct")
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--torch_dtype", type=str, default="float32")
     parser.add_argument("--layer_idx", type=int, default=0)
     parser.add_argument("--seq_len", type=int, default=8)
     parser.add_argument("--cache_len", type=int, default=0)
