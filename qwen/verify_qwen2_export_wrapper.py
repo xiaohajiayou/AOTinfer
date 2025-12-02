@@ -3,7 +3,7 @@ import argparse
 import torch
 from transformers import AutoTokenizer
 
-from qwen.adapters.qwen2_adapter import Qwen2Adapter
+from qwen.models.qwen2_adapter import Qwen2Adapter
 
 
 @torch.no_grad()

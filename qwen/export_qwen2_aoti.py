@@ -4,7 +4,7 @@ import os
 import torch
 from transformers import AutoTokenizer
 
-from qwen.adapters.qwen2_adapter import Qwen2Adapter
+from qwen.models.qwen2_adapter import Qwen2Adapter
 
 
 class Qwen2AOTIWrapper(torch.nn.Module):

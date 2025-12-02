@@ -13,7 +13,7 @@ from transformers import (
 )
 
 from qwen2_5_vl.export_qwen2_5_vl_aoti import flatten_inputs, unflatten_outputs
-from qwen2_5_vl.adapter import Qwen2_5_VLAdapter
+from qwen2_5_vl.models.adapter import Qwen2_5_VLAdapter
 
 
 class AOTIRunner:

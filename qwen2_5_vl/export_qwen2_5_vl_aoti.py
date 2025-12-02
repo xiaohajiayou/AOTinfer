@@ -5,7 +5,7 @@ from typing import Tuple
 import torch
 from transformers import AutoTokenizer
 
-from qwen2_5_vl.adapter import Qwen2_5_VLAdapter
+from qwen2_5_vl.models.adapter import Qwen2_5_VLAdapter
 
 """
 Export Qwen2.5-VL to an AOTI package.

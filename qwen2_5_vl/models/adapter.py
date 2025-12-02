@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoModelForVision2Seq
 
-from qwen2_5_vl.models import Qwen2_5_VLExportModel
+from qwen2_5_vl.models.qwen2_5_vl_block import Qwen2_5_VLExportModel
 
 
 class Qwen2_5_VLAdapter:
