@@ -1,70 +1,69 @@
 """
-Adapter wrapper for MiniCPM, aligned with qwen2_5_vl style.
-Provides a class interface and a scatter helper.
-
-TODO: wire to actual HF MiniCPM model and export-friendly implementation.
+MiniCPM Adapter：
+- 提供 MiniCPMAdapter，加载 HF 模型并拆出三段子模块（vision_resampler / embed_scatter / llm）
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
+from minicpm.models.model import build_from_hf
+from minicpm.models.vision import SiglipVisionExport
+from minicpm.models.resampler import ResamplerExport
+from minicpm.models.llm import build_llm_from_hf
+from minicpm.models.scatter import scatter_vision_tokens
 
-def scatter_vision_tokens(
-    text_embeds: torch.Tensor,
-    vision_tokens: torch.Tensor,
-    image_bound: torch.Tensor,
-    max_tokens: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Replace placeholder positions in text embeddings with vision tokens.
 
-    Args:
-        text_embeds: [B, T, H]
-        vision_tokens: [N, L, H] where N = num_slices (flattened across batch)
-        image_bound: [B, K, 2] start/end indices per slice (exclusive end), padded with zeros
-        max_tokens: optional cap on how many vision tokens to consume (for safety)
-    Returns:
-        new_embeds: [B, T, H]
-    """
-    new_embeds = text_embeds.clone()
-    B, _, H = text_embeds.shape
-    _, K, _ = image_bound.shape
+class VisionResamplerWrapper(nn.Module):
+    """将 SiglipVisionExport + ResamplerExport 合并，便于导出/调用。"""
 
-    vidx = 0
-    for b in range(B):
-        for k in range(K):
-            start, end = image_bound[b, k]
-            if end <= start:
-                continue  # padded
-            length = int(end - start)
-            if max_tokens is not None:
-                length = min(length, max_tokens)
-            if length <= 0:
-                continue
-            if vidx >= vision_tokens.shape[0]:
-                break
-            vt = vision_tokens[vidx]
-            vidx += 1
-            if vt.shape[0] < length:
-                pad_len = length - vt.shape[0]
-                vt = torch.cat([vt, torch.zeros(pad_len, H, device=vt.device, dtype=vt.dtype)], dim=0)
-            new_embeds[b, start:end] = vt[:length]
-    return new_embeds
+    def __init__(self, vision: nn.Module, resampler: nn.Module):
+        super().__init__()
+        self.vision = vision
+        self.resampler = resampler
+
+    def forward(self, pixel_values: torch.Tensor, tgt_sizes: torch.Tensor):
+        hidden = self.vision(pixel_values, tgt_sizes=tgt_sizes)
+        tokens = self.resampler(hidden, tgt_sizes=tgt_sizes)
+        return tokens
+
+
+class MiniCPMEmbedScatter(nn.Module):
+    """文本 embedding + 可选 scatter（无图则原样返回）。"""
+
+    def __init__(self, embed_tokens: nn.Embedding, scale_emb: float = 1.0):
+        super().__init__()
+        self.embed_tokens = embed_tokens
+        self.scale_emb = scale_emb
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        vision_tokens: Optional[torch.Tensor] = None,
+        image_bound: Optional[torch.Tensor] = None,
+    ):
+        embeds = self.embed_tokens(input_ids) * self.scale_emb
+        if vision_tokens is not None and image_bound is not None:
+            embeds = scatter_vision_tokens(embeds, vision_tokens.to(embeds.dtype), image_bound)
+        return embeds
 
 
 class MiniCPMAdapter:
     """
-    Wrap HF MiniCPM into an export-friendly interface (placeholder skeleton).
-    Pattern mirrors qwen2_5_vl.models.adapter.Qwen2_5_VLAdapter.
+    加载 HF MiniCPM，拆出三段子模块，供导出或 wrapper 使用。
     """
 
-    def __init__(self, hf_model: nn.Module, export_model: Optional[nn.Module] = None):
+    def __init__(self, hf_model: nn.Module, tokenizer: Optional[AutoTokenizer] = None):
         self.hf_model = hf_model
+        self.tokenizer = tokenizer
         self.config = getattr(hf_model, "config", None)
-        self.export_model = export_model  # will be MiniCPMModel instance
+        # 子模块占位
+        self.vision_resampler: Optional[nn.Module] = None
+        self.embed_scatter: Optional[nn.Module] = None
+        self.llm: Optional[nn.Module] = None
+        self.scale_emb: float = 1.0
 
     @classmethod
     def from_pretrained(
@@ -72,37 +71,43 @@ class MiniCPMAdapter:
         model_path: str,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        local_files_only: bool = True,
     ):
         hf_model = AutoModel.from_pretrained(
             model_path,
             trust_remote_code=True,
             torch_dtype=dtype,
             device_map=device,
+            local_files_only=local_files_only,
+            init_vision=True,
+            init_audio=False,
+            init_tts=False,
         ).eval()
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        adapter = cls(hf_model)
-        adapter.tokenizer = tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=local_files_only)
+        adapter = cls(hf_model, tokenizer)
+        adapter.build_submodules()
         return adapter
 
-    def init_kv_cache(
-        self,
-        batch_size: int,
-        cache_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> List[torch.Tensor]:
-        # Placeholder; real impl depends on MiniCPM block structure
-        num_layers = getattr(self.config, "num_hidden_layers", 0)
-        num_kv_heads = getattr(self.config, "num_key_value_heads", 0)
-        head_dim = getattr(self.config, "hidden_size", 0) // getattr(self.config, "num_attention_heads", 1)
-        cache = []
-        for _ in range(num_layers):
-            cache.append(torch.zeros(batch_size, num_kv_heads, cache_len, head_dim, dtype=dtype, device=device))
-        return cache
+    def build_submodules(self):
+        # 视觉/Resampler
+        if hasattr(self.hf_model, "vpm") or hasattr(self.hf_model, "vision_model"):
+            vpm = self.hf_model.vpm if hasattr(self.hf_model, "vpm") else self.hf_model.vision_model
+            vision_export = SiglipVisionExport.from_hf(vpm)
+            res_export = ResamplerExport.from_hf(
+                self.hf_model.resampler, num_heads=self.hf_model.config.vision_config.num_attention_heads
+            )
+            self.vision_resampler = VisionResamplerWrapper(vision_export, res_export)
+        # LLM
+        hf_llm = self.hf_model.llm if hasattr(self.hf_model, "llm") else self.hf_model
+        decoder, embed_tokens, scale_emb = build_llm_from_hf(hf_llm)
+        self.embed_scatter = MiniCPMEmbedScatter(embed_tokens, scale_emb=scale_emb)
+        self.llm = decoder
+        self.scale_emb = scale_emb
 
-    def build_export_model(self, vision: nn.Module, resampler: nn.Module, llm: nn.Module):
-        # 延迟导入以避免循环引用
-        from minicpm.models.model import MiniCPMModel
-
-        self.export_model = MiniCPMModel(vision, resampler, llm, hidden_size=getattr(self.config, "hidden_size", 0))
-        return self.export_model
+    def get_export_modules(self):
+        """
+        返回三段子模块 (vision_resampler, embed_scatter, llm) 供导出使用。
+        """
+        if self.vision_resampler is None or self.embed_scatter is None or self.llm is None:
+            self.build_submodules()
+        return self.vision_resampler, self.embed_scatter, self.llm

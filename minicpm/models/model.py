@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .adapter import scatter_vision_tokens
+from .scatter import scatter_vision_tokens
 from .vision import SiglipVisionExport
 from .resampler import ResamplerExport
 from .llm import build_llm_from_hf
