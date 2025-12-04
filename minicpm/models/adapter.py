@@ -24,9 +24,9 @@ class VisionResamplerWrapper(nn.Module):
         self.vision = vision
         self.resampler = resampler
 
-    def forward(self, pixel_values: torch.Tensor, tgt_sizes: torch.Tensor, export_mode: bool = False):
+    def forward(self, pixel_values: torch.Tensor, tgt_sizes: torch.Tensor):
         hidden = self.vision(pixel_values, tgt_sizes=tgt_sizes)
-        tokens = self.resampler(hidden, tgt_sizes=tgt_sizes, export_mode=export_mode)
+        tokens = self.resampler(hidden, tgt_sizes=tgt_sizes)
         return tokens
 
 

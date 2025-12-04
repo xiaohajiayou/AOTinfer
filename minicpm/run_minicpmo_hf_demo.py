@@ -120,9 +120,9 @@ class AOTIRunner(BaseRunner):
             pass
         self.device_index = device_index
         self.dtype = dtype
-        self.vision = torch._inductor.aoti_load_package(vision_path, device_index=device_index).loader
-        self.embed = torch._inductor.aoti_load_package(embed_path, device_index=device_index).loader
-        self.llm = torch._inductor.aoti_load_package(llm_path, device_index=device_index).loader
+        self.vision = torch._inductor.aoti_load_package(vision_path)
+        self.embed = torch._inductor.aoti_load_package(embed_path)
+        self.llm = torch._inductor.aoti_load_package(llm_path)
 
         # 读取导出时的元信息
         meta_path = os.path.join(os.path.dirname(llm_path), "minicpm_export_meta.json")
@@ -140,7 +140,7 @@ class AOTIRunner(BaseRunner):
         if pixel_values is None:
             return None
         # 输入 shape: (S,3,14,W_flat), (S,2)
-        out = self.vision.run(pixel_values, tgt_sizes)
+        out = self.vision(pixel_values, tgt_sizes)
         return out
 
     @torch.inference_mode()
@@ -149,8 +149,8 @@ class AOTIRunner(BaseRunner):
             vision_tokens = torch.zeros(
                 (0, 64, self.hidden_size), device=input_ids.device, dtype=self.dtype
             )
-            image_bound = torch.zeros((input_ids.shape[0], 0, 2), device=input_ids.device, dtype=torch.long)
-        out = self.embed.run(input_ids, vision_tokens, image_bound)
+            image_bound = torch.zeros((input_ids.shape[0], 0, 2), device=input_ids.device, dtype=torch.int64)
+        out = self.embed(input_ids, vision_tokens, image_bound)
         return out
 
     @torch.inference_mode()
@@ -167,7 +167,7 @@ class AOTIRunner(BaseRunner):
                     )
                 )
             past_kv = tuple(kv)
-        out = self.llm.run(inputs_embeds, past_kv)
+        out = self.llm(inputs_embeds, past_kv)
         logits, new_kv = out[0], out[1]
         return logits, new_kv
 
@@ -207,7 +207,7 @@ def parse_args():
     ap.add_argument("--prompt", type=str, default="请描述图片里的内容。")
     ap.add_argument("--image", type=str, default=None)
     ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--torch-dtype", type=str, default="bfloat16")
+    ap.add_argument("--dtype", type=str, default="bfloat16")
     ap.add_argument("--max-new-tokens", type=int, default=30)
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--use-wrapper", action="store_true", help="使用自研前向 runner；否则默认 HF")
@@ -222,7 +222,7 @@ def parse_args():
 def main():
     args = parse_args()
     device = args.device
-    dtype = getattr(torch, args.torch_dtype)
+    dtype = getattr(torch, args.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
     image = load_image(args.image) if args.image else None
@@ -289,7 +289,7 @@ def main():
             pixel_values = torch.stack(
                 [torch.from_numpy(pv).to(device=device, dtype=dtype) for pv in pixel_list[:num_slices]], dim=0
             )
-            tgt_sizes = torch.from_numpy(tgt_sizes_np[:num_slices]).to(device)
+            tgt_sizes = torch.from_numpy(tgt_sizes_np[:num_slices]).to(device=device, dtype=torch.int64)
 
     # runner 选择：优先 AOTI，其次 wrapper，默认 HF
     if args.vision_pt and args.embed_pt and args.llm_pt:
