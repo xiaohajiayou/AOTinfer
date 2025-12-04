@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--model-path",
         type=str,
         default="/home/liwenxiao/models/minicpm_o_2_6",
+        # default="/home/liwenxiao/models/minicpm_o_2_6_int4",
         help="本地模型目录（含 config.json 等文件），建议使用无点/连字符的路径避免动态模块命名问题",
     )
     parser.add_argument(
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
+        default="cpu",
         choices=["auto", "cuda", "cpu"],
         help="推理设备，auto 优先使用 CUDA。",
     )
@@ -72,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=30,
         help="生成最大新 token 数。",
     )
     parser.add_argument(
@@ -115,6 +116,17 @@ def main() -> None:
         init_tts=False,
         local_files_only=True,
     )
+    
+    # model = AutoGPTQForCausalLM.from_quantized(
+    #     args.model_path,
+    #     trust_remote_code=True,
+    #     attn_implementation=args.attn,
+    #     torch_dtype=dtype,
+    #     init_vision=not args.no_vision,
+    #     init_audio=False,
+    #     init_tts=False,
+    #     local_files_only=True,
+    # )
     model = model.eval().to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -132,24 +144,35 @@ def main() -> None:
     if image is not None:
         msgs[0]["content"] = [image, args.prompt]
 
+    # if args.compare:
     if True:
         # 对比 HF 与自研前向 logits（单步）
         processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
-        # 文本模板：占位符 + 文本，交给 processor 生成 image_bound
+        # 固定为 HF 默认模板，确保与调试打印一致：
+        # <|im_start|>system ... <|im_end|>
+        # <|im_start|>user\n(<image>./</image>)\n<prompt><|im_end|>
+        # <|im_start|>assistant\n
+        system_block = (
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+        )
         if image is not None:
-            prompt_text = f"(<image>./</image>)\n{args.prompt}"
+            user_block = f"<|im_start|>user\n(<image>./</image>)\n{args.prompt}<|im_end|>\n"
+        else:
+            user_block = f"<|im_start|>user\n{args.prompt}<|im_end|>\n"
+        final_text = system_block + user_block + "<|im_start|>assistant\n"
+        if image is not None:
             proc = processor(
-                text=[prompt_text],
+                text=[final_text],
                 images=[image],
                 return_tensors="pt",
                 max_slice_nums=processor.image_processor.max_slice_nums if hasattr(processor, "image_processor") else 2,
                 add_special_tokens=True,
-                use_image_id=False,
+                use_image_id=True,
                 chunk_input=True,
             )
         else:
             proc = processor(
-                text=[args.prompt],
+                text=[final_text],
                 return_tensors="pt",
                 add_special_tokens=True,
             )
@@ -167,8 +190,9 @@ def main() -> None:
         pixel_values = tgt_sizes = None
         if image is not None:
             img_np = np.array(image.convert("RGB"))
-            img_size = getattr(model.config.vision_config, "image_size", 980)
-            patch_size = getattr(model.config.vision_config, "patch_size", 14)
+            # 使用 HF image_processor 的尺度/patch 配置，避免与官方预处理不一致
+            img_size = processor.image_processor.scale_resolution if hasattr(processor, "image_processor") else 448
+            patch_size = processor.image_processor.patch_size if hasattr(processor, "image_processor") else 14
             s_max = processor.image_processor.max_slice_nums if hasattr(processor, "image_processor") else 2
             pixel_list, tgt_sizes_np, slice_counts = preprocess_images(
                 [img_np],
@@ -176,13 +200,16 @@ def main() -> None:
                 scale_resolution=img_size,
                 patch_size=patch_size,
             )
-            pixel_values, tgt_sizes = pad_slices_to_tensor(
-                pixel_list, tgt_sizes_np, s_max=s_max, h=img_size, w=img_size, device=device
-            )
-            pixel_values = pixel_values.to(device=device, dtype=dtype)
+            # 严格复刻 HF：保持切片 list，不做 pad，逐切片送入 vision/resampler
             num_slices = slice_counts[0]
-            pixel_values = pixel_values[:num_slices]
-            tgt_sizes = tgt_sizes[:num_slices].to(device)
+            if num_slices == 0:
+                pixel_values = torch.empty((0, 3, patch_size, 0), device=device, dtype=dtype)
+                tgt_sizes = None
+            else:
+                pixel_values = torch.stack(
+                    [torch.from_numpy(pv).to(device=device, dtype=dtype) for pv in pixel_list[:num_slices]], dim=0
+                )  # [S,3,patch,patch*num_patches]
+                tgt_sizes = torch.from_numpy(tgt_sizes_np[:num_slices]).to(device) if len(tgt_sizes_np) > 0 else None
 
         # 准备 HF 生成用的输入，确保在同一 device/dtype，并使用自研视觉张量以避免设备不一致
         proc_hf = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -199,6 +226,7 @@ def main() -> None:
             if image is not None and pixel_values is not None and image_bound is not None:
                 vision_hidden = custom_model.vision(pixel_values, tgt_sizes=tgt_sizes)
                 vision_tokens = custom_model.resampler(vision_hidden, tgt_sizes=tgt_sizes)
+                vision_tokens = vision_tokens.to(inputs_embeds.dtype)
                 inputs_embeds = scatter_vision_tokens(inputs_embeds, vision_tokens, image_bound)
             position_ids = torch.arange(0, inputs_embeds.shape[1], device=device).unsqueeze(0)
             hf_out = model.llm(
@@ -215,53 +243,64 @@ def main() -> None:
         rel = max_abs / max_val if max_val > 0 else float("nan")
         print("[COMPARE] logits max diff:", max_abs)
         print("[COMPARE] logits relative diff:", rel)
-
-        # 简易生成对比（贪心），步数受 --max-new-tokens 限制；若失败则跳过
-        print("[COMPARE] 开始贪心生成对比")
-        try:
-            gen_kwargs = dict(max_new_tokens=args.max_new_tokens, do_sample=False, return_dict_in_generate=False)
-            position_ids = torch.arange(0, inputs_embeds.shape[1], device=device).unsqueeze(0)
-            hf_gen_ids = model.llm.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **gen_kwargs,
+        # HF 手写贪心（使用相同的 inputs_embeds/attention_mask，避免再次跑视觉）
+        print("[COMPARE] HF 贪心生成")
+        hf_kv = None
+        cur_emb = inputs_embeds
+        attn_mask_step = attention_mask
+        hf_gen = []
+        for _ in range(args.max_new_tokens):
+            out = model.llm(
+                input_ids=None,
+                inputs_embeds=cur_emb,
+                attention_mask=attn_mask_step,
+                past_key_values=hf_kv,
+                use_cache=True,
+                return_dict=True,
             )
-            hf_new_tokens = hf_gen_ids[0]
-            hf_text = tokenizer.decode(hf_new_tokens, skip_special_tokens=True)
+            hf_kv = out.past_key_values
+            next_id = out.logits[:, -1, :].argmax(dim=-1)
+            hf_gen.append(next_id)
+            cur_emb = model.llm.model.embed_tokens(next_id.unsqueeze(1))
+            attn_mask_step = torch.cat([attn_mask_step, torch.ones_like(attn_mask_step[:, :1])], dim=1)
+            if tokenizer.eos_token_id is not None and (next_id == tokenizer.eos_token_id).all():
+                break
+        hf_ids = torch.cat(hf_gen, dim=0) if hf_gen else torch.tensor([], device=device, dtype=input_ids.dtype)
+        hf_text = tokenizer.decode(hf_ids, skip_special_tokens=True)
+        print("[COMPARE] HF 生成：", hf_text)
 
-            # 自研生成（贪心）
-            custom_kv = None
-            cur_embeds = inputs_embeds
-            gen_ids = []
-            for _ in range(args.max_new_tokens):
-                logits, custom_kv = custom_model.decoder(cur_embeds, past_key_values=custom_kv)
-                next_id = logits[:, -1, :].argmax(dim=-1)
-                gen_ids.append(next_id)
-                cur_embeds = custom_model.embed_tokens(next_id.unsqueeze(1)) * custom_model.scale_emb
-            my_ids = torch.cat(gen_ids, dim=0) if gen_ids else torch.tensor([], device=device, dtype=input_ids.dtype)
-            my_text = tokenizer.decode(my_ids, skip_special_tokens=True)
-
-            print("[COMPARE] HF 生成：", hf_text)
-            print("[COMPARE] 自研生成：", my_text)
-        except Exception as e:
-            print(f"[COMPARE] 生成对比失败，跳过（{e}）")
+        # 自研贪心
+        print("[COMPARE] 自研贪心生成")
+        custom_kv = None
+        cur_embeds = inputs_embeds
+        gen_ids = []
+        eos_id = tokenizer.eos_token_id
+        for _ in range(args.max_new_tokens):
+            logits, custom_kv = custom_model.decoder(cur_embeds, past_key_values=custom_kv)
+            next_id = logits[:, -1, :].argmax(dim=-1)
+            gen_ids.append(next_id)
+            cur_embeds = custom_model.embed_tokens(next_id.unsqueeze(1)) * custom_model.scale_emb
+            if eos_id is not None and (next_id == eos_id).all():
+                break
+        my_ids = torch.cat(gen_ids, dim=0) if gen_ids else torch.tensor([], device=device, dtype=input_ids.dtype)
+        my_text = tokenizer.decode(my_ids, skip_special_tokens=True)
+        print("[COMPARE] 自研生成：", my_text)
         return
-
-    print("[INFO] 开始推理...")
-    with torch.inference_mode():
-        answer = model.chat(
-            image=image if image is not None else None,
-            msgs=msgs,
-            tokenizer=tokenizer,
-            max_new_tokens=args.max_new_tokens,
-            sampling=True,
-            chunk_input=True,
-            omni_input=False,
-            use_tts_template=False,
-            generate_audio=False,
-            return_dict=False,
-        )
+    else:
+        print("[INFO] 开始推理... (HF chat 贪心)")
+        with torch.inference_mode():
+            answer = model.chat(
+                image=image if image is not None else None,
+                msgs=msgs,
+                tokenizer=tokenizer,
+                max_new_tokens=args.max_new_tokens,
+                sampling=False,  # 关闭采样，贪心解码
+                chunk_input=True,
+                omni_input=False,
+                use_tts_template=False,
+                generate_audio=False,
+                return_dict=False,
+            )
 
     print("\n====== 模型输出 ======")
     print(answer)

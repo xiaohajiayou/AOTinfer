@@ -56,6 +56,7 @@ class MiniCPMModel(nn.Module):
         if pixel_values is not None and image_bound is not None:
             vision_hidden = self.vision(pixel_values, tgt_sizes=tgt_sizes)
             vision_tokens = self.resampler(vision_hidden, tgt_sizes=tgt_sizes)
+            vision_tokens = vision_tokens.to(text_embeds.dtype)
             inputs_embeds = scatter_vision_tokens(text_embeds, vision_tokens, image_bound)
 
         logits, new_kvs = self.decoder(inputs_embeds, past_key_values)

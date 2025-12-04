@@ -1,15 +1,15 @@
 """
-OpenCV-based image preprocessing to mimic MiniCPM HF processor:
- - optional slicing into grid tiles when image is large
- - resize to scale_resolution (default 448) with dimensions divisible by patch_size
- - normalize (mean/std=0.5), convert to CHW
+OpenCV 预处理，复刻 HF MiniCPMVImageProcessor 的核心逻辑：
+ - 根据原图面积/长宽比决定是否切片（grid），默认 scale_resolution=448, patch_size=14。
+ - 每个切片 resize 成最接近且能被 patch_size 整除的大小。
+ - 归一化 (mean/std=0.5) 后做 patchify，输出 [3, patch_size, num_patches]。
 
-Outputs:
- - pixel_values: list of np.ndarray per slice, shape [3, H, W] (normalized, RGB)
- - tgt_sizes: np.ndarray of shape [num_slices, 2] with patch grid (H/patch, W/patch)
- - slice_counts: number of slices per original image
+返回：
+ - pixel_values: list[np.ndarray]，每个元素 [3, patch_size, num_patches]（与 HF reshape_by_patch 对齐）
+ - tgt_sizes: np.ndarray [num_slices, 2]，每切片的 patch 网格 (H/patch, W/patch)
+ - slice_counts: list，每张图的切片数
 
-Note: image_bound (占位符起止) 依赖文本 token 位置，这里仅返回每张图的切片数，供上游根据模板计算占位长度（每切片 64）。
+注意：不再强制 resize 成正方形 980×980，patch 数与 HF 完全一致（如 25×41=1025）。
 """
 
 from typing import List, Tuple
@@ -110,34 +110,26 @@ def slice_image(
     return slices
 
 
-def normalize_and_chw(
+def normalize_and_patchify(
     img_rgb: np.ndarray,
     patch_size: int,
-    target_size: int,
     mean: float = 0.5,
     std: float = 0.5,
 ) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
-    Args:
-        img_rgb: np.ndarray uint8 or float, shape (H,W,3), RGB
-    Returns:
-        chw: np.ndarray [3, H, W] normalized
-        grid: (H/patch, W/patch)
+    Normalize + patchify to [3, patch_size, num_patches] (HF reshape_by_patch 对齐)
     """
-    # 强制 resize 到目标尺寸，保持与 HF vision_config.image_size 对齐
-    if img_rgb.shape[0] != target_size or img_rgb.shape[1] != target_size:
-        import cv2
-
-        img_rgb = cv2.resize(img_rgb, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
-
     img = img_rgb.astype(np.float32) / 255.0
     img = (img - mean) / std
-    # to CHW
-    chw = np.transpose(img, (2, 0, 1))
+    chw = np.transpose(img, (2, 0, 1))  # [3,H,W]
     C, H, W = chw.shape
     assert H % patch_size == 0 and W % patch_size == 0, "H/W must be divisible by patch_size"
     grid = (H // patch_size, W // patch_size)
-    return chw, grid
+    # patchify
+    t = torch.from_numpy(chw)
+    patches = torch.nn.functional.unfold(t, (patch_size, patch_size), stride=(patch_size, patch_size))
+    patches = patches.reshape(C, patch_size, patch_size, -1).permute(0, 1, 3, 2).reshape(C, patch_size, -1)
+    return patches.numpy(), grid
 
 
 def preprocess_images(
@@ -161,8 +153,11 @@ def preprocess_images(
         slices = slice_image(img, max_slice_nums, scale_resolution, patch_size)
         slice_counts.append(len(slices))
         for s in slices:
-            chw, grid = normalize_and_chw(s, patch_size, target_size=scale_resolution)
-            pixel_values.append(chw)
+            # resize 到最接近且可整除的尺寸
+            best_w, best_h = find_best_resize((s.shape[1], s.shape[0]), scale_resolution, patch_size, allow_upscale=True)
+            s_resized = cv2.resize(s, (best_w, best_h), interpolation=cv2.INTER_CUBIC)
+            pv, grid = normalize_and_patchify(s_resized, patch_size)
+            pixel_values.append(pv)
             tgt_sizes.append(np.array(grid, dtype=np.int32))
     tgt_sizes_arr = np.vstack(tgt_sizes) if tgt_sizes else np.zeros((0, 2), dtype=np.int32)
     return pixel_values, tgt_sizes_arr, slice_counts
@@ -185,23 +180,25 @@ def pad_slices_to_tensor(
     pixel_values: List[np.ndarray],
     tgt_sizes: np.ndarray,
     s_max: int,
-    h: int,
-    w: int,
+    max_width: int | None,
+    patch_size: int,
     device: str = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Pad/stack slice outputs to fixed shapes:
-      pixel_values -> [S_max, 3, H, W]
+    Pad/stack slice outputs:
+      pixel_values -> [S_max, 3, patch_size, max_width] （按宽度补 0，宽度=patch_size*num_patches）
       tgt_sizes -> [S_max, 2]
     """
     import torch
 
     S = min(len(pixel_values), s_max)
-    pv = torch.zeros((s_max, 3, h, w), dtype=torch.float32, device=device)
+    if max_width is None or max_width <= 0:
+        max_width = max(int(pv.shape[-1]) for pv in pixel_values[:S]) if S > 0 else 0
+    pv = torch.zeros((s_max, 3, patch_size, max_width), dtype=torch.float32, device=device)
     ts = torch.zeros((s_max, 2), dtype=torch.int64, device=device)
     for i in range(S):
-        chw = pixel_values[i]  # [3, H, W]
-        h_i, w_i = chw.shape[1], chw.shape[2]
-        pv[i, :, :h_i, :w_i] = torch.from_numpy(chw)
+        pv_i = pixel_values[i]  # [3, patch_size, width]
+        width = pv_i.shape[-1]
+        pv[i, :, :, :width] = torch.from_numpy(pv_i)
         ts[i] = torch.from_numpy(tgt_sizes[i])
     return pv, ts
