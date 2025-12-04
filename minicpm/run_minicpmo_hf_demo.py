@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 MiniCPM 推理/对比脚本（HF / 自研 Wrapper），runner 仅封装三段模型调用，prefill+decode 在外部统一。
+ python minicpm/run_minicpmo_hf_demo.py   --model-path /home/liwenxiao/models/minicpm_o_2_6   --image /home/liwenxiao/AOTinfer/qwen2_5_vl/test.png      --device cuda    --use-wrapper --compare-hf
 """
 
 import argparse

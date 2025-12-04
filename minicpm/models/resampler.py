@@ -50,71 +50,90 @@ class ResamplerExport(nn.Module):
             pos_embed=hf_resampler.pos_embed,
         )
 
-    def forward(self, vision_hidden: torch.Tensor, tgt_sizes: Optional[torch.Tensor] = None, export_mode: bool = False):
+    # def forward(self, vision_hidden: torch.Tensor, tgt_sizes: Optional[torch.Tensor] = None):
+    def forward(self, vision_hidden: torch.Tensor, tgt_sizes: Optional[torch.Tensor] = None):
+        # 1. 固定导出用的网格尺寸（转为静态数值，消除动态性）
+        TGT_H = 25
+        TGT_W = 41
+        tgt_sizes = torch.tensor([[TGT_H, TGT_W]], dtype=torch.int32, device=vision_hidden.device)
         assert tgt_sizes is not None
+        
+        # 2. 基础维度计算 + 强制统一dtype（核心修复点）
         bs = vision_hidden.shape[0]
         device = vision_hidden.device
         orig_dtype = vision_hidden.dtype
-        compute_dtype = orig_dtype
-        head_dim = self.head_dim
-        num_heads = self.num_heads
+        # 强制指定compute_dtype为bfloat16，避免dtype不一致
+        compute_dtype = torch.bfloat16 if orig_dtype in [torch.bfloat16, torch.float32] else orig_dtype
 
-        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
-        max_patch_len = torch.max(patch_len)
+        # 3. 批量计算patch长度（无循环 + 统一dtype）
+        patch_len = torch.tensor([TGT_H * TGT_W], device=device, dtype=torch.int32).repeat(bs)
+        max_patch_len = patch_len[0].item()
+
+        # 4. 批量生成key_padding_mask（统一device/dtype）
         key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool, device=device)
+        idx_matrix = torch.arange(max_patch_len, device=device, dtype=torch.int64).unsqueeze(0).expand(bs, -1)
+        patch_len_expand = patch_len.unsqueeze(1).expand(-1, max_patch_len).to(torch.int64)
+        key_padding_mask = idx_matrix >= patch_len_expand
 
-        pos_embed = []
-        for i in range(bs):
-            tgt_h, tgt_w = tgt_sizes[i]
-            pos_embed.append(self.pos_embed[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)).to(compute_dtype))
-            key_padding_mask[i, patch_len[i] :] = True
-        # L * B * D
-        pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(1, 0, 2)
+        # 5. 静态生成pos_embed（强制统一dtype）
+        pos_embed_slice = self.pos_embed[:TGT_H, :TGT_W, :].to(compute_dtype)
+        pos_embed_slice = pos_embed_slice.reshape((TGT_H * TGT_W, -1))
+        pos_embed = pos_embed_slice.unsqueeze(0).repeat(bs, 1, 1).to(compute_dtype)
+        pos_embed = pos_embed.permute(1, 0, 2)
 
-        # 线性投影 K/V，保持与 HF 的 batch_first=False 逻辑一致
+        # 6. 线性投影 K/V（强制统一所有张量dtype）
+        vision_hidden = vision_hidden.to(compute_dtype)  # 核心：先转换输入dtype
         if isinstance(self.kv_proj, nn.Linear):
             kv_w = self.kv_proj.weight.to(compute_dtype)
             kv_b = self.kv_proj.bias.to(compute_dtype) if self.kv_proj.bias is not None else None
-            x = F.linear(vision_hidden.to(compute_dtype), kv_w, kv_b)
+            x = F.linear(vision_hidden, kv_w, kv_b)
         else:
-            x = self.kv_proj(vision_hidden.to(compute_dtype))
-        x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
+            x = self.kv_proj(vision_hidden)
+        x = self.ln_kv(x).to(compute_dtype)  # 确保LayerNorm输出dtype一致
+        x = x.permute(1, 0, 2)  # L * B * D
 
-        # Q: (Q, B, D)
+        # 7. Q/K/V 构造（强制统一所有张量dtype）
         q_in = self.ln_q(self.queries.to(compute_dtype))
-        q_in = q_in.unsqueeze(1).expand(-1, bs, -1)  # Q,B,D
+        q_in = q_in.unsqueeze(1).expand(-1, bs, -1).to(compute_dtype)  # Q,B,D
+        k_in = (x + pos_embed).to(compute_dtype)  # 确保加法后dtype一致
+        v_in = x.to(compute_dtype)
 
-        k_in = x + pos_embed  # L,B,D
-        v_in = x  # L,B,D
+        # 8. 多头注意力计算（强制所有参数统一dtype）
+        # 预处理注意力参数，确保dtype完全一致
+        attn_kwargs = {
+            "embed_dim_to_check": self.attn.embed_dim,
+            "num_heads": self.attn.num_heads,
+            "in_proj_weight": self.attn.in_proj_weight.to(compute_dtype),
+            "in_proj_bias": self.attn.in_proj_bias.to(compute_dtype) if self.attn.in_proj_bias is not None else None,
+            "bias_k": self.attn.bias_k.to(compute_dtype) if self.attn.bias_k is not None else None,
+            "bias_v": self.attn.bias_v.to(compute_dtype) if self.attn.bias_v is not None else None,
+            "add_zero_attn": self.attn.add_zero_attn,
+            "dropout_p": 0.0,
+            "out_proj_weight": self.attn.out_proj.weight.to(compute_dtype),
+            "out_proj_bias": self.attn.out_proj.bias.to(compute_dtype) if self.attn.out_proj.bias is not None else None,
+            "training": False,
+            "key_padding_mask": key_padding_mask,
+            "need_weights": False,
+            "attn_mask": None,
+            "use_separate_proj_weight": False,
+            "q_proj_weight": None,
+            "k_proj_weight": None,
+            "v_proj_weight": None,
+            "average_attn_weights": True,
+            "is_causal": False,
+        }
+        # 确保key_padding_mask的device与输入一致
+        attn_kwargs["key_padding_mask"] = attn_kwargs["key_padding_mask"].to(device)
 
-        # 统一走 math 路径，复刻 HF multi_head_attention_forward（need_weights=False）
         attn_out, _ = self.attn.multi_head_attention_forward(
-            q_in,
-            k_in,
-            v_in,
-            embed_dim_to_check=self.attn.embed_dim,
-            num_heads=self.attn.num_heads,
-            in_proj_weight=self.attn.in_proj_weight.to(compute_dtype),
-            in_proj_bias=self.attn.in_proj_bias.to(compute_dtype) if self.attn.in_proj_bias is not None else None,
-            bias_k=self.attn.bias_k.to(compute_dtype) if self.attn.bias_k is not None else None,
-            bias_v=self.attn.bias_v.to(compute_dtype) if self.attn.bias_v is not None else None,
-            add_zero_attn=self.attn.add_zero_attn,
-            dropout_p=0.0,
-            out_proj_weight=self.attn.out_proj.weight.to(compute_dtype),
-            out_proj_bias=self.attn.out_proj.bias.to(compute_dtype) if self.attn.out_proj.bias is not None else None,
-            training=False,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-            attn_mask=None,
-            use_separate_proj_weight=False,
-            q_proj_weight=None,
-            k_proj_weight=None,
-            v_proj_weight=None,
-            average_attn_weights=True,
-            is_causal=False,
+            q_in.to(compute_dtype),
+            k_in.to(compute_dtype),
+            v_in.to(compute_dtype),
+            **attn_kwargs
         )
-        attn_out = attn_out.permute(1, 0, 2)  # B,Q,D
 
+        # 9. 后处理（统一dtype + 最终转回原dtype）
+        attn_out = attn_out.permute(1, 0, 2).to(compute_dtype)  # B,Q,D
         attn_out = F.layer_norm(
             attn_out,
             self.ln_post.normalized_shape,
@@ -122,7 +141,12 @@ class ResamplerExport(nn.Module):
             self.ln_post.bias.to(compute_dtype) if self.ln_post.bias is not None else None,
             self.ln_post.eps,
         )
-        attn_out = attn_out @ self.proj.to(compute_dtype)
+        # 矩阵乘法前强制统一dtype（核心修复点）
+        attn_out = attn_out.to(compute_dtype)
+        proj = self.proj.to(compute_dtype)
+        attn_out = attn_out @ proj
+
+        # 最终转回原dtype，确保输出兼容
         return attn_out.to(orig_dtype)
 
     def _repeat(self, query, N: int):

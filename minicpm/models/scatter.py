@@ -1,46 +1,44 @@
-from typing import Optional
-
 import torch
+from typing import Optional
 
 
 def scatter_vision_tokens(
     text_embeds: torch.Tensor,
-    vision_tokens: torch.Tensor,
-    image_bound: torch.Tensor,
-    max_tokens: Optional[int] = None,
+    vision_tokens: Optional[torch.Tensor],
+    image_bound: Optional[torch.Tensor],
+    export_mode: bool = False,
 ) -> torch.Tensor:
     """
     Replace placeholder positions in text embeddings with vision tokens.
-
     Args:
         text_embeds: [B, T, H]
-        vision_tokens: [N, L, H] where N = num_slices (flattened across batch)
-        image_bound: [B, K, 2] start/end indices per slice (exclusive end), padded with zeros
-        max_tokens: optional cap on how many vision tokens to consume (for safety)
-    Returns:
-        new_embeds: [B, T, H]
+        vision_tokens: [N, 64, H] flattened per slice
+        image_bound: [B, K, 2] start/end indices per slice (exclusive end)
+        export_mode: if True, assume单张图单区间，走静态路径
     """
-    new_embeds = text_embeds.clone()
-    B, _, H = text_embeds.shape
-    _, K, _ = image_bound.shape
+    if vision_tokens is None or image_bound is None:
+        return text_embeds
 
-    vidx = 0
+    new_embeds = text_embeds.clone()
+    if export_mode:
+        start = int(image_bound[0, 0, 0])
+        end = int(image_bound[0, 0, 1])
+        length = max(end - start, 0)
+        if length > 0:
+            new_embeds[0, start:end] = vision_tokens[0, :length].to(new_embeds.dtype)
+        return new_embeds
+
+    B = text_embeds.size(0)
+    H = text_embeds.size(-1)
+    vt = vision_tokens.to(new_embeds.dtype)
+    offset = 0
     for b in range(B):
-        for k in range(K):
-            start, end = image_bound[b, k]
-            if end <= start:
-                continue  # padded
-            length = int(end - start)
-            if max_tokens is not None:
-                length = min(length, max_tokens)
-            if length <= 0:
-                continue
-            if vidx >= vision_tokens.shape[0]:
-                break
-            vt = vision_tokens[vidx]
-            vidx += 1
-            if vt.shape[0] < length:
-                pad_len = length - vt.shape[0]
-                vt = torch.cat([vt, torch.zeros(pad_len, H, device=vt.device, dtype=vt.dtype)], dim=0)
-            new_embeds[b, start:end] = vt[:length]
+        bounds = image_bound[b]
+        for m in range(bounds.size(0)):
+            start = int(bounds[m, 0])
+            end = int(bounds[m, 1])
+            length = max(end - start, 0)
+            if length > 0:
+                new_embeds[b, start:end] = vt[offset, :length]
+                offset += length
     return new_embeds

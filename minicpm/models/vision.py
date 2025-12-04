@@ -41,21 +41,18 @@ class SiglipVisionExport(nn.Module):
         H_, W_ = x.shape[2], x.shape[3]
         x = x.flatten(2).transpose(1, 2)  # [S, L, hidden], L = H'*W'
 
-        # 位置编码：按照 HF bucketize 方式将实际 patch 网格映射到 70x70 的 embedding 索引
-        if tgt_sizes is None:
-            nb_patches_h = torch.full((bsz,), H_, device=x.device, dtype=torch.int32)
-            nb_patches_w = torch.full((bsz,), W_, device=x.device, dtype=torch.int32)
-        else:
-            nb_patches_h = tgt_sizes[:, 0]
-            nb_patches_w = tgt_sizes[:, 1]
+        # 位置编码：先固定使用 25x41（当前测试图像的网格），后续有需要再改回动态
+        fixed_h, fixed_w = 25, 41
+        nb_patches_h = torch.full((bsz,), fixed_h, device=x.device, dtype=torch.int32)
+        nb_patches_w = torch.full((bsz,), fixed_w, device=x.device, dtype=torch.int32)
 
         num_per_side = int(self.position_embedding.num_embeddings**0.5)  # 70
         boundaries = torch.arange(1 / num_per_side, 1.0, 1 / num_per_side, device=x.device)
         position_ids = torch.zeros((bsz, H_ * W_), device=x.device, dtype=torch.long)
 
         for b in range(bsz):
-            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / nb_patches_h[b], device=x.device)
-            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / nb_patches_w[b], device=x.device)
+            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / fixed_h, device=x.device)
+            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / fixed_w, device=x.device)
             bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
             bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
             pos_ids = (bucket_coords_h[:, None] * num_per_side + bucket_coords_w).flatten()

@@ -24,9 +24,9 @@ class VisionResamplerWrapper(nn.Module):
         self.vision = vision
         self.resampler = resampler
 
-    def forward(self, pixel_values: torch.Tensor, tgt_sizes: torch.Tensor):
+    def forward(self, pixel_values: torch.Tensor, tgt_sizes: torch.Tensor, export_mode: bool = False):
         hidden = self.vision(pixel_values, tgt_sizes=tgt_sizes)
-        tokens = self.resampler(hidden, tgt_sizes=tgt_sizes)
+        tokens = self.resampler(hidden, tgt_sizes=tgt_sizes, export_mode=export_mode)
         return tokens
 
 
@@ -43,10 +43,13 @@ class MiniCPMEmbedScatter(nn.Module):
         input_ids: torch.Tensor,
         vision_tokens: Optional[torch.Tensor] = None,
         image_bound: Optional[torch.Tensor] = None,
+        export_mode: bool = False,
     ):
         embeds = self.embed_tokens(input_ids) * self.scale_emb
         if vision_tokens is not None and image_bound is not None:
-            embeds = scatter_vision_tokens(embeds, vision_tokens.to(embeds.dtype), image_bound)
+            embeds = scatter_vision_tokens(
+                embeds, vision_tokens.to(embeds.dtype), image_bound, export_mode=export_mode
+            )
         return embeds
 
 
