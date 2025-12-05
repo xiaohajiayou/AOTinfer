@@ -60,9 +60,13 @@ class HFRunner(BaseRunner):
         return embeds
 
     @torch.inference_mode()
-    def llm_step(self, inputs_embeds, past_kv=None, attention_mask=None):
-        cache_len = past_kv[0][0].shape[2] if past_kv else 0
-        position_ids = torch.arange(cache_len, cache_len + inputs_embeds.shape[1], device=inputs_embeds.device).view(1, -1)
+    def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):
+        cache_len_val = 0 if cache_len is None else int(cache_len.item()) if torch.is_tensor(cache_len) else int(cache_len)
+        past_kv = None
+        if key_cache is not None and value_cache is not None:
+            past_kv = tuple(zip(key_cache, value_cache))
+        position_ids = torch.arange(cache_len_val, cache_len_val + inputs_embeds.shape[1],
+                                    device=inputs_embeds.device).view(1, -1)
         out = self.model.llm(
             input_ids=None,
             inputs_embeds=inputs_embeds,
@@ -72,7 +76,11 @@ class HFRunner(BaseRunner):
             use_cache=True,
             return_dict=True,
         )
-        return out.logits, out.past_key_values
+        new_key = tuple(k for k, v in out.past_key_values)
+        new_value = tuple(v for k, v in out.past_key_values)
+        new_cache_len = torch.tensor(cache_len_val + inputs_embeds.shape[1],
+                                     device=inputs_embeds.device, dtype=torch.long)
+        return out.logits, new_key, new_value, new_cache_len
 
 
 class WrapperRunner(BaseRunner):
@@ -95,9 +103,21 @@ class WrapperRunner(BaseRunner):
         return embeds
 
     @torch.inference_mode()
-    def llm_step(self, inputs_embeds, past_kv=None, attention_mask=None):
-        logits, new_kv = self.model.decoder(inputs_embeds, past_key_values=past_kv)
-        return logits, new_kv
+    def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):
+        if key_cache is None or value_cache is None:
+            key_cache = []
+            value_cache = []
+            for _ in range(len(self.model.decoder.layers)):
+                key_cache.append(torch.zeros(inputs_embeds.size(0), self.model.decoder.num_kv_heads, 0,
+                                             self.model.decoder.head_dim, device=inputs_embeds.device,
+                                             dtype=inputs_embeds.dtype))
+                value_cache.append(torch.zeros_like(key_cache[-1]))
+        if cache_len is None:
+            cache_len = torch.tensor(0, device=inputs_embeds.device, dtype=torch.long)
+        logits, key_cache, value_cache, cache_len = self.model.decoder(inputs_embeds, key_cache, value_cache, cache_len)
+        return logits, key_cache, value_cache, cache_len
+
+
 
 
 class AOTIRunner(BaseRunner):
@@ -146,30 +166,37 @@ class AOTIRunner(BaseRunner):
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
         if vision_tokens is None or image_bound is None:
-            vision_tokens = torch.zeros(
-                (0, 64, self.hidden_size), device=input_ids.device, dtype=self.dtype
-            )
-            image_bound = torch.zeros((input_ids.shape[0], 0, 2), device=input_ids.device, dtype=torch.int64)
+            vision_tokens = torch.zeros((input_ids.size(0), 0, self.hidden_size),
+                                        device=input_ids.device, dtype=self.dtype)
+            image_bound = torch.zeros((input_ids.size(0), 0, 2),
+                                      device=input_ids.device, dtype=torch.long)
         out = self.embed(input_ids, vision_tokens, image_bound)
+
         return out
 
     @torch.inference_mode()
-    def llm_step(self, inputs_embeds, past_kv=None, attention_mask=None):
-        if past_kv is None:
-            # 以空 KV 初始化，形状需与导出一致
-            bsz = inputs_embeds.shape[0]
-            kv = []
-            for _ in range(self.num_layers):
-                kv.append(
-                    (
-                        torch.zeros(bsz, self.num_kv_heads, 0, self.head_dim, device=inputs_embeds.device, dtype=inputs_embeds.dtype),
-                        torch.zeros(bsz, self.num_kv_heads, 0, self.head_dim, device=inputs_embeds.device, dtype=inputs_embeds.dtype),
-                    )
+    def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):
+        bsz = inputs_embeds.shape[0]
+        if key_cache is None or value_cache is None:
+            key_cache = [
+                torch.zeros(
+                    bsz,
+                    self.num_kv_heads,
+                    0,
+                    self.head_dim,
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
                 )
-            past_kv = tuple(kv)
-        out = self.llm(inputs_embeds, past_kv)
-        logits, new_kv = out[0], out[1]
-        return logits, new_kv
+                for _ in range(self.num_layers)
+            ]
+            value_cache = [torch.zeros_like(k) for k in key_cache]
+            cache_len_tensor = torch.tensor(0, dtype=torch.long, device=inputs_embeds.device)
+        else:
+            cache_len_tensor = cache_len if isinstance(cache_len, torch.Tensor) else torch.tensor(cache_len, device=inputs_embeds.device, dtype=torch.long)
+
+        out = self.llm(inputs_embeds, key_cache, value_cache, cache_len_tensor)
+        logits, new_key, new_value, new_cache_len = out
+        return logits, new_key, new_value, new_cache_len
 
 
 def greedy_generate(
@@ -181,40 +208,42 @@ def greedy_generate(
     max_new_tokens: int,
     tokenizer,
 ):
+    # init cache
+    key_cache = value_cache = None
+    cache_len = torch.tensor(0, device=input_ids.device, dtype=torch.long)
     # prefill
     inputs_embeds = runner.build_inputs(input_ids, vision_tokens, image_bound)
-    logits, kv = runner.llm_step(inputs_embeds, past_kv=None, attention_mask=attention_mask)
-    generated: List[torch.Tensor] = [logits[:, -1, :].argmax(dim=-1)]
+    logits, key_cache, value_cache, cache_len = runner.llm_step(inputs_embeds, key_cache, value_cache, cache_len, attention_mask)
+    generated = [logits[:, -1, :].argmax(dim=-1, keepdim=True)]
     attn_mask = attention_mask
-
     for _ in range(max_new_tokens):
-        cur_input_ids = generated[-1].unsqueeze(1)
-        cur_emb = runner.build_inputs(cur_input_ids, None, None)
+        cur_emb = runner.build_inputs(generated[-1], None, None)
         if isinstance(runner, HFRunner) and attn_mask is not None:
             attn_mask = torch.cat([attn_mask, torch.ones_like(attn_mask[:, :1])], dim=1)
-        logits, kv = runner.llm_step(cur_emb, past_kv=kv, attention_mask=attn_mask if isinstance(runner, HFRunner) else None)
-        next_id = logits[:, -1, :].argmax(dim=-1)
+        logits, key_cache, value_cache, cache_len = runner.llm_step(cur_emb, key_cache, value_cache, cache_len, attn_mask)
+        next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
         generated.append(next_id)
         if tokenizer.eos_token_id is not None and (next_id == tokenizer.eos_token_id).all():
             break
-    gen_ids = torch.cat(generated, dim=0)
-    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+    gen_ids = torch.cat(generated, dim=1)
+    return tokenizer.decode(gen_ids[0], skip_special_tokens=True)
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
     ap.add_argument("--prompt", type=str, default="请描述图片里的内容。")
-    ap.add_argument("--image", type=str, default=None)
+    ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="bfloat16")
     ap.add_argument("--max-new-tokens", type=int, default=30)
     ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--use-wrapper", action="store_true", help="使用自研前向 runner；否则默认 HF")
+    ap.add_argument("--use-aoti", action="store_true", help="使用aotinductor前向 runner；否则默认 HF")
     ap.add_argument("--compare-hf", action="store_true", help="同时跑 HF runner 对比输出（仅 use-wrapper 时生效）")
-    ap.add_argument("--vision-pt", type=str, help="AOTI vision_resampler pt2 路径")
-    ap.add_argument("--embed-pt", type=str, help="AOTI embed_scatter pt2 路径")
-    ap.add_argument("--llm-pt", type=str, help="AOTI llm pt2 路径")
+    ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed_scatter.pt2", help="AOTI embed_scatter pt2 路径")
+    ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
     ap.add_argument("--device-index", type=int, default=-1, help="AOTI 设备索引，GPU 用 0/1，CPU 用 -1")
     return ap.parse_args()
 
@@ -228,16 +257,7 @@ def main():
     image = load_image(args.image) if args.image else None
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
 
-    model = AutoModel.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        device_map=device,
-        init_vision=not args.no_vision,
-        init_audio=False,
-        init_tts=False,
-        local_files_only=True,
-    ).eval()
+
 
     # 构造模板文本
     system_block = (
@@ -291,14 +311,28 @@ def main():
             )
             tgt_sizes = torch.from_numpy(tgt_sizes_np[:num_slices]).to(device=device, dtype=torch.int64)
 
+    model = None
+    runner = None
+
+        
     # runner 选择：优先 AOTI，其次 wrapper，默认 HF
-    if args.vision_pt and args.embed_pt and args.llm_pt:
+    if args.use_aoti:
+    # if True:
         runner = AOTIRunner(args.vision_pt, args.embed_pt, args.llm_pt, device_index=args.device_index, dtype=dtype)
-    elif args.use_wrapper:
+    else:
+        if model is None:
+            model = AutoModel.from_pretrained(
+                args.model_path,
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map=device,
+                init_vision=not args.no_vision,
+                init_audio=False,
+                init_tts=False,
+                local_files_only=True,
+            ).eval()
         custom_model = build_from_hf(model).to(device)
         runner = WrapperRunner(custom_model, tokenizer)
-    else:
-        runner = HFRunner(model, tokenizer)
 
     # 推理
     vision_tokens = runner.encode_image(pixel_values, tgt_sizes)
@@ -313,8 +347,19 @@ def main():
     )
     print("=== Runner 输出 ===")
     print(text_out)
-
-    if args.compare_hf and (args.use_wrapper or args.vision_pt):
+    
+    if args.compare_hf:
+        if model is None:
+            model = AutoModel.from_pretrained(
+                args.model_path,
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map=device,
+                init_vision=not args.no_vision,
+                init_audio=False,
+                init_tts=False,
+                local_files_only=True,
+            ).eval()
         hf_runner = HFRunner(model, tokenizer)
         vision_tokens_hf = hf_runner.encode_image(pixel_values, tgt_sizes)
         hf_text = greedy_generate(

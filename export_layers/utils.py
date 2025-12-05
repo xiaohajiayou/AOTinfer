@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 
 
 def repeat_kv(hidden_states: torch.Tensor, num_groups: int) -> torch.Tensor:
@@ -17,3 +18,4 @@ def repeat_kv(hidden_states: torch.Tensor, num_groups: int) -> torch.Tensor:
         bsz, num_kv_heads, num_groups, seq_len, head_dim
     )
     return hidden_states.reshape(bsz, num_kv_heads * num_groups, seq_len, head_dim)
+

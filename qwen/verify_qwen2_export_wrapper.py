@@ -2,7 +2,6 @@ import argparse
 
 import torch
 from transformers import AutoTokenizer
-
 from qwen.models.qwen2_adapter import Qwen2Adapter
 
 
@@ -17,8 +16,10 @@ def verify(args):
     tok = tokenizer(prompt, return_tensors="pt").to(args.device)
     batch_size, prompt_len = tok["input_ids"].shape
 
-    key_cache = adapter.init_kv_cache(batch_size, 0, export_model.embed.weight.dtype, tok["input_ids"].device)
-    value_cache = adapter.init_kv_cache(batch_size, 0, export_model.embed.weight.dtype, tok["input_ids"].device)
+    cache_dtype = export_model.embed.weight.dtype
+    device = tok["input_ids"].device
+    key_cache = adapter.init_kv_cache(batch_size, 0, cache_dtype, device)
+    value_cache = adapter.init_kv_cache(batch_size, 0, cache_dtype, device)
     cache_len = torch.tensor(0, dtype=torch.long, device=tok["input_ids"].device)
 
     hf_out = hf_model(**tok, use_cache=True, return_dict=True)

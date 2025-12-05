@@ -3,7 +3,6 @@ import os
 
 import torch
 from transformers import AutoTokenizer
-
 from qwen.models.qwen2_adapter import Qwen2Adapter
 
 
@@ -58,18 +57,8 @@ def export_and_package(args):
         dtype=torch.long,
         device=args.device,
     )
-    key_cache = adapter.init_kv_cache(
-        1,
-        example_cache_len,
-        dtype=export_model.embed.weight.dtype,
-        device=args.device,
-    )
-    value_cache = adapter.init_kv_cache(
-        1,
-        example_cache_len,
-        dtype=export_model.embed.weight.dtype,
-        device=args.device,
-    )
+    key_cache = adapter.init_kv_cache(1, example_cache_len, export_model.embed.weight.dtype, args.device)
+    value_cache = adapter.init_kv_cache(1, example_cache_len, export_model.embed.weight.dtype, args.device)
     cache_len_tensor = torch.tensor(example_cache_len, dtype=torch.long, device=args.device)
     flat_example = flatten_inputs(example_ids, key_cache, value_cache, cache_len_tensor)
 

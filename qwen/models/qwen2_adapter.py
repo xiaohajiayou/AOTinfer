@@ -35,7 +35,8 @@ class Qwen2Adapter:
         cache_len: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> List[torch.Tensor]:
+    ):
+        device = torch.device(device)
         num_layers = len(self.export_model.layers)
         num_kv_heads = self.config.num_key_value_heads
         head_dim = self.config.hidden_size // self.config.num_attention_heads

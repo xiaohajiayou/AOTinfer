@@ -4,7 +4,6 @@ from typing import Tuple
 
 import torch
 from transformers import AutoTokenizer
-
 from qwen2_5_vl.models.adapter import Qwen2_5_VLAdapter
 
 """
@@ -83,18 +82,8 @@ def export_and_package(args):
     hidden_size = adapter.config.hidden_size
     vision_tokens = torch.randn(1, example_vis, hidden_size, device=args.device, dtype=getattr(torch, args.torch_dtype))
 
-    key_cache = adapter.init_kv_cache(
-        1,
-        example_cache_len,
-        dtype=export_model.embed.weight.dtype,
-        device=args.device,
-    )
-    value_cache = adapter.init_kv_cache(
-        1,
-        example_cache_len,
-        dtype=export_model.embed.weight.dtype,
-        device=args.device,
-    )
+    key_cache = adapter.init_kv_cache(1, example_cache_len, export_model.embed.weight.dtype, args.device)
+    value_cache = adapter.init_kv_cache(1, example_cache_len, export_model.embed.weight.dtype, args.device)
     cache_len_tensor = torch.tensor(example_cache_len, dtype=torch.long, device=args.device)
     flat_example = flatten_inputs(example_ids, vision_tokens, key_cache, value_cache, cache_len_tensor)
 

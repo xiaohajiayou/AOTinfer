@@ -42,13 +42,12 @@ class MiniCPMEmbedScatter(nn.Module):
         self,
         input_ids: torch.Tensor,
         vision_tokens: Optional[torch.Tensor] = None,
-        image_bound: Optional[torch.Tensor] = None,
-        export_mode: bool = False,
+        image_bound: Optional[torch.Tensor] = None
     ):
         embeds = self.embed_tokens(input_ids) * self.scale_emb
         if vision_tokens is not None and image_bound is not None:
             embeds = scatter_vision_tokens(
-                embeds, vision_tokens.to(embeds.dtype), image_bound, export_mode=export_mode
+                embeds, vision_tokens.to(embeds.dtype), image_bound
             )
         return embeds
 
@@ -102,9 +101,9 @@ class MiniCPMAdapter:
             self.vision_resampler = VisionResamplerWrapper(vision_export, res_export)
         # LLM
         hf_llm = self.hf_model.llm if hasattr(self.hf_model, "llm") else self.hf_model
-        decoder, embed_tokens, scale_emb = build_llm_from_hf(hf_llm)
+        model, embed_tokens, scale_emb = build_llm_from_hf(hf_llm)
         self.embed_scatter = MiniCPMEmbedScatter(embed_tokens, scale_emb=scale_emb)
-        self.llm = decoder
+        self.llm = model
         self.scale_emb = scale_emb
 
     def get_export_modules(self):
@@ -114,3 +113,30 @@ class MiniCPMAdapter:
         if self.vision_resampler is None or self.embed_scatter is None or self.llm is None:
             self.build_submodules()
         return self.vision_resampler, self.embed_scatter, self.llm
+
+    def init_kv_cache(
+        self,
+        batch_size: int,
+        cache_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        device = torch.device(device)
+        if self.llm is None:
+            self.build_submodules()
+        num_layers = len(self.llm.layers)
+        num_kv_heads = self.config.num_key_value_heads
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        cache = []
+        for _ in range(num_layers):
+            cache.append(
+                torch.zeros(
+                    batch_size,
+                    num_kv_heads,
+                    cache_len,
+                    head_dim,
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+        return cache
