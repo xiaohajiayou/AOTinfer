@@ -20,12 +20,50 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from minicpm.models.model import build_from_hf
-from minicpm.models.adapter import scatter_vision_tokens
 from minicpm.preprocess.image_preprocess import preprocess_images
 
 
 def load_image(path: str) -> Image.Image:
     return Image.open(path).convert("RGB")
+
+
+def scatter_vision_tokens(
+    text_embeds: torch.Tensor,
+    vision_tokens: Optional[torch.Tensor],
+    image_bound: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """用视觉 token 替换文本 embedding 中的占位符。"""
+    if (
+        vision_tokens is None
+        or image_bound is None
+        or image_bound.numel() == 0
+        or vision_tokens.numel() == 0
+    ):
+        return text_embeds
+
+    new_embeds = text_embeds.clone()
+    max_vis = vision_tokens.shape[1]
+    seq_len = new_embeds.shape[1]
+
+    for b in range(image_bound.size(0)):
+        bounds = image_bound[b]
+        for m in range(bounds.size(0)):
+            start = bounds[m, 0].item()
+            end = bounds[m, 1].item()
+            length = max(end - start, 0)
+            if length == 0:
+                continue
+
+            idx = torch.arange(max_vis, device=new_embeds.device)
+            target_pos = start + idx
+            valid = (idx < length) & (target_pos < seq_len)
+            target_indices = target_pos[valid].long()
+
+            src = vision_tokens[b, valid].to(new_embeds.dtype)
+            if target_indices.numel() > 0:
+                new_embeds[b].index_copy_(0, target_indices, src)
+
+    return new_embeds
 
 
 class BaseRunner:
@@ -54,9 +92,14 @@ class HFRunner(BaseRunner):
 
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
-        embeds = self.model.llm.model.embed_tokens(input_ids) * getattr(self.model.llm.config, "scale_emb", 1.0)
+        embeds = (
+            self.model.llm.model.embed_tokens(input_ids)
+            * getattr(self.model.llm.config, "scale_emb", 1.0)
+        )
         if vision_tokens is not None and image_bound is not None:
-            embeds = scatter_vision_tokens(embeds, vision_tokens.to(embeds.dtype), image_bound)
+            embeds = scatter_vision_tokens(
+                embeds, vision_tokens.to(embeds.dtype), image_bound
+            )
         return embeds
 
     @torch.inference_mode()
@@ -97,9 +140,9 @@ class WrapperRunner(BaseRunner):
 
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
-        embeds = self.model.embed_tokens(input_ids) * self.model.scale_emb
+        embeds = self.embed_model(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
         if vision_tokens is not None and image_bound is not None:
-            embeds = scatter_vision_tokens(embeds, vision_tokens.to(embeds.dtype), image_bound)
+            embeds = scatter_vision_tokens(embeds, vision_tokens, image_bound)
         return embeds
 
     @torch.inference_mode()
@@ -165,14 +208,10 @@ class AOTIRunner(BaseRunner):
 
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
-        if vision_tokens is None or image_bound is None:
-            vision_tokens = torch.zeros((input_ids.size(0), 0, self.hidden_size),
-                                        device=input_ids.device, dtype=self.dtype)
-            image_bound = torch.zeros((input_ids.size(0), 0, 2),
-                                      device=input_ids.device, dtype=torch.long)
-        out = self.embed(input_ids, vision_tokens, image_bound)
-
-        return out
+        embeds = self.embed_model(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
+        if vision_tokens is not None and image_bound is not None:
+            embeds = scatter_vision_tokens(embeds, vision_tokens, image_bound)
+        return embeds
 
     @torch.inference_mode()
     def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):

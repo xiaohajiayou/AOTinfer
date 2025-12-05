@@ -59,46 +59,24 @@ def export_vision_resampler(module, out_dir: str, args):
     )
 
 
-def export_embed_scatter(module, out_dir: str, args):
-    torch_dtype = getattr(torch, args.dtype)  # 如 "float32" → torch.float32
-    torch_device = torch.device(args.device)  # 如 "cuda:0" → torch.device("cuda:0")
-    device_str = args.device  # 设备字符串（用于编译选项）
-    input_ids = torch.zeros((1, 128), dtype=torch.int32, device=torch_device)
+def export_embed(module, out_dir: str, args):
+    torch_dtype = getattr(torch, args.dtype)
+    torch_device = torch.device(args.device)
 
-    vision_tokens = torch.zeros(
-        (1, 0, module.embed_tokens.weight.shape[1]), dtype=torch_dtype, device=torch_device
-    )
-    image_bound = torch.zeros((1, 0, 2), dtype=torch.int64, device=torch_device)
+    input_ids = torch.zeros((1, args.example_seq), dtype=torch.int32, device=torch_device)
+    T = Dim("seq_len")
 
-    T = Dim("seq_len")  # 显式定义动态维度
-    V = Dim("num_vision", min=0, max=64)
-    B = Dim("num_bounds", min=0, max=64)
     exported = torch.export.export(
         module,
-        (input_ids, vision_tokens, image_bound),
-        dynamic_shapes=[
-            {1: T},  # input_ids
-            {1: V},  # vision_tokens length
-            {1: B},  # image_bound count
-        ],
+        (input_ids,),
+        dynamic_shapes=({1: T},),
     )
+
     os.makedirs(out_dir, exist_ok=True)
-    package_path = os.path.join(out_dir, "minicpm_embed_scatter.pt2")
-    print(f"[export] embed_scatter compiling to {package_path}")
-    # ========== 修复 2：编译选项按设备适配 ==========
-    compile_options = {
-        "device": device_str,
-        "dtype": torch_dtype,
-        "disable_mixed_mm": True if device_str == "cpu" else False,
-        "cpu_fallback": True if device_str == "cpu" else False,
-        "triton": False if device_str == "cpu" else True,
-        "disable_cudagraphs": True if device_str == "cpu" else False,
-    }
-    torch._inductor.aoti_compile_and_package(
-        exported, 
-        package_path=package_path,
-        # options=compile_options
-    )
+    package_path = os.path.join(out_dir, "minicpm_embed.pt2")
+    print(f"[export] embed compiling to {package_path}")
+    torch._inductor.aoti_compile_and_package(exported, package_path=package_path)
+
 
 
 
@@ -164,10 +142,10 @@ def main():
     torch_device = torch.device(args.device)  # 如 "cuda:0" → torch.device("cuda:0")
 
     adapter = MiniCPMAdapter.from_pretrained(args.model_dir, device=torch_device, dtype=torch_dtype)
-    vision_resampler, embed_scatter, llm = adapter.get_export_modules()
+    vision_resampler, embed, llm = adapter.get_export_modules()
 
     # export_vision_resampler(vision_resampler.to(torch_device, torch_dtype), args.out_dir, args)
-    export_embed_scatter(embed_scatter.to(torch_device, torch_dtype), args.out_dir, args)
+    export_embed(embed.to(torch_device, torch_dtype), args.out_dir, args)
     # export_llm(llm.to(torch_device, torch_dtype), adapter, args.out_dir, args)
 
 
