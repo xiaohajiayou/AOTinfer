@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MiniCPM 推理/对比脚本（HF / 自研 Wrapper），runner 仅封装三段模型调用，prefill+decode 在外部统一。
- python minicpm/run_minicpmo_hf_demo.py   --model-path /home/liwenxiao/models/minicpm_o_2_6   --image /home/liwenxiao/AOTinfer/qwen2_5_vl/test.png      --device cuda    --use-wrapper --compare-hf
+ python minicpm/run_minicpmo_hf_demo.py   --model-dir /home/liwenxiao/models/minicpm_o_2_6   --image /home/liwenxiao/AOTinfer/qwen2_5_vl/test.png      --device cuda    --use-wrapper --compare-hf
 """
 
 import argparse
@@ -15,11 +15,23 @@ import torch
 from PIL import Image
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
+# add project root to sys.path so `minicpm` can be imported when running directly
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from minicpm.models.adapter import MiniCPMAdapter
+from minicpm.export_minicpm_aoti import flatten_inputs, unflatten_outputs
+# torch._inductor.config.cache_size_limit = 2 * 1024 * 1024 * 1024  # 2GB
+# 禁用不必要的调试缓存
+torch._inductor.config.debug = False
+torch._inductor.config.trace.enabled = False
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/root/autodl-tmp/torch_inductor_cache"
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from minicpm.models.model import build_from_hf
+# from minicpm.models.model import build_from_hf
 from minicpm.preprocess.image_preprocess import preprocess_images
 
 
@@ -94,7 +106,6 @@ class HFRunner(BaseRunner):
     def build_inputs(self, input_ids, vision_tokens, image_bound):
         embeds = (
             self.model.llm.model.embed_tokens(input_ids)
-            * getattr(self.model.llm.config, "scale_emb", 1.0)
         )
         if vision_tokens is not None and image_bound is not None:
             embeds = scatter_vision_tokens(
@@ -127,40 +138,77 @@ class HFRunner(BaseRunner):
 
 
 class WrapperRunner(BaseRunner):
-    def __init__(self, model, tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
+    def __init__(self, wrapper_adapter, vision_path, embed_path, llm_path, device_index: int):
+        self.adapter = wrapper_adapter
+        self.vision, self.embed, self.llm = self.adapter.get_export_modules()
+        # self.vision = torch._inductor.aoti_load_package(vision_path, device_index=device_index)
+        # self.embed = torch._inductor.aoti_load_package(embed_path, device_index=device_index)
+        # self.llm = torch._inductor.aoti_load_package(llm_path, device_index=device_index)
+        # 读取导出时的元信息
+        meta_path = os.path.join(os.path.dirname(llm_path), "minicpm_export_meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"meta file not found: {meta_path}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        self.num_layers = meta["num_layers"]
+        self.num_kv_heads = meta["num_kv_heads"]
+        self.head_dim = meta["head_dim"]
+        self.hidden_size = meta["hidden_size"]
 
     @torch.inference_mode()
     def encode_image(self, pixel_values, tgt_sizes):
         if pixel_values is None:
             return None
-        vis_h = self.model.vision(pixel_values, tgt_sizes=tgt_sizes)
-        return self.model.resampler(vis_h, tgt_sizes=tgt_sizes)
+        out = self.vision(pixel_values, tgt_sizes=tgt_sizes)
+        return out
 
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
-        embeds = self.embed_model(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
+        input_ids = input_ids.to(torch.long)
+        embeds = self.embed(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
         if vision_tokens is not None and image_bound is not None:
             embeds = scatter_vision_tokens(embeds, vision_tokens, image_bound)
         return embeds
 
+    # @torch.inference_mode()
+    # def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):
+    #     if key_cache is None or value_cache is None:
+    #         key_cache = []
+    #         value_cache = []
+    #         for _ in range(len(self.model.decoder.layers)):
+    #             key_cache.append(torch.zeros(inputs_embeds.size(0), self.model.decoder.num_kv_heads, 0,
+    #                                          self.model.decoder.head_dim, device=inputs_embeds.device,
+    #                                          dtype=inputs_embeds.dtype))
+    #             value_cache.append(torch.zeros_like(key_cache[-1]))
+    #     if cache_len is None:
+    #         cache_len = torch.tensor(0, device=inputs_embeds.device, dtype=torch.long)
+    #     logits, key_cache, value_cache, cache_len = self.model.decoder(inputs_embeds, key_cache, value_cache, cache_len)
+    #     return logits, key_cache, value_cache, cache_len
+
     @torch.inference_mode()
     def llm_step(self, inputs_embeds, key_cache=None, value_cache=None, cache_len=None, attention_mask=None):
+        bsz = inputs_embeds.shape[0]
         if key_cache is None or value_cache is None:
-            key_cache = []
-            value_cache = []
-            for _ in range(len(self.model.decoder.layers)):
-                key_cache.append(torch.zeros(inputs_embeds.size(0), self.model.decoder.num_kv_heads, 0,
-                                             self.model.decoder.head_dim, device=inputs_embeds.device,
-                                             dtype=inputs_embeds.dtype))
-                value_cache.append(torch.zeros_like(key_cache[-1]))
-        if cache_len is None:
-            cache_len = torch.tensor(0, device=inputs_embeds.device, dtype=torch.long)
-        logits, key_cache, value_cache, cache_len = self.model.decoder(inputs_embeds, key_cache, value_cache, cache_len)
-        return logits, key_cache, value_cache, cache_len
+            key_cache = [
+                torch.zeros(
+                    bsz,
+                    self.num_kv_heads,
+                    0,
+                    self.head_dim,
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                )
+                for _ in range(self.num_layers)
+            ]
+            value_cache = [torch.zeros_like(k) for k in key_cache]
+            cache_len_tensor = torch.tensor(0, dtype=torch.long, device=inputs_embeds.device)
+        else:
+            cache_len_tensor = cache_len if isinstance(cache_len, torch.Tensor) else torch.tensor(cache_len, device=inputs_embeds.device, dtype=torch.long)
 
-
+        # cache_len_tensor = cache_len_tensor.to(torch.int32)
+        out = self.llm(inputs_embeds, key_cache, value_cache, cache_len_tensor)
+        logits, new_key, new_value, new_cache_len = out
+        return logits, new_key, new_value, new_cache_len
 
 
 class AOTIRunner(BaseRunner):
@@ -171,21 +219,19 @@ class AOTIRunner(BaseRunner):
 
     def __init__(self, vision_path, embed_path, llm_path, device_index: int, dtype: torch.dtype):
         # 确保 codecache 存在
-        try:
-            import importlib
+        # try:
+        #     import importlib
 
-            spec = importlib.util.find_spec("torch._inductor.codecache")
-            if spec is not None:
-                import torch._inductor.codecache as _cc  # type: ignore
+        #     spec = importlib.util.find_spec("torch._inductor.codecache")
+        #     if spec is not None:
+        #         import torch._inductor.codecache as _cc  # type: ignore
 
-                torch._inductor.codecache = _cc  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        self.device_index = device_index
-        self.dtype = dtype
-        self.vision = torch._inductor.aoti_load_package(vision_path)
-        self.embed = torch._inductor.aoti_load_package(embed_path)
-        self.llm = torch._inductor.aoti_load_package(llm_path)
+        #         torch._inductor.codecache = _cc  # type: ignore[attr-defined]
+        # except Exception:
+        #     pass
+        self.vision = torch._inductor.aoti_load_package(vision_path, device_index=device_index)
+        self.embed = torch._inductor.aoti_load_package(embed_path, device_index=device_index)
+        self.llm = torch._inductor.aoti_load_package(llm_path, device_index=device_index)
 
         # 读取导出时的元信息
         meta_path = os.path.join(os.path.dirname(llm_path), "minicpm_export_meta.json")
@@ -208,7 +254,8 @@ class AOTIRunner(BaseRunner):
 
     @torch.inference_mode()
     def build_inputs(self, input_ids, vision_tokens, image_bound):
-        embeds = self.embed_model(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
+        input_ids = input_ids.to(torch.long)
+        embeds = self.embed(input_ids)  # HF: model.llm.model.embed_tokens；AOTI: PT2 embed
         if vision_tokens is not None and image_bound is not None:
             embeds = scatter_vision_tokens(embeds, vision_tokens, image_bound)
         return embeds
@@ -233,9 +280,13 @@ class AOTIRunner(BaseRunner):
         else:
             cache_len_tensor = cache_len if isinstance(cache_len, torch.Tensor) else torch.tensor(cache_len, device=inputs_embeds.device, dtype=torch.long)
 
+        # cache_len_tensor = cache_len_tensor.to(torch.int32)
         out = self.llm(inputs_embeds, key_cache, value_cache, cache_len_tensor)
         logits, new_key, new_value, new_cache_len = out
         return logits, new_key, new_value, new_cache_len
+        # flat = flatten_inputs(inputs_embeds, key_cache, value_cache, cache_len)
+        # outputs = self.llm.loader.run(flat)
+        # return unflatten_outputs(outputs, self.num_layers)
 
 
 def greedy_generate(
@@ -270,9 +321,19 @@ def greedy_generate(
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-path", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
     ap.add_argument("--prompt", type=str, default="请描述图片里的内容。")
-    ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
+    # ap.add_argument("--model-dir", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
+    # ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
+    # ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    # ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed_scatter.pt2", help="AOTI embed_scatter pt2 路径")
+    # ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
+
+    ap.add_argument("--model-dir", type=str, default="/root/autodl-tmp/models/MiniCPM_o_2_6")
+    ap.add_argument("--image", type=str, default="/root/autodl-tmp/AOTinfer/qwen2_5_vl/test.png")
+    ap.add_argument("--vision-pt", default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    ap.add_argument("--embed-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
+    ap.add_argument("--llm-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
+
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="bfloat16")
     ap.add_argument("--max-new-tokens", type=int, default=30)
@@ -280,9 +341,6 @@ def parse_args():
     ap.add_argument("--use-wrapper", action="store_true", help="使用自研前向 runner；否则默认 HF")
     ap.add_argument("--use-aoti", action="store_true", help="使用aotinductor前向 runner；否则默认 HF")
     ap.add_argument("--compare-hf", action="store_true", help="同时跑 HF runner 对比输出（仅 use-wrapper 时生效）")
-    ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
-    ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed_scatter.pt2", help="AOTI embed_scatter pt2 路径")
-    ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
     ap.add_argument("--device-index", type=int, default=-1, help="AOTI 设备索引，GPU 用 0/1，CPU 用 -1")
     return ap.parse_args()
 
@@ -292,9 +350,11 @@ def main():
     device = args.device
     dtype = getattr(torch, args.dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
-    image = load_image(args.image) if args.image else None
-    processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True, local_files_only=True)
+    image = None
+    if not args.no_vision:
+        image = load_image(args.image) if args.image else None
+    processor = AutoProcessor.from_pretrained(args.model_dir, trust_remote_code=True)
 
 
 
@@ -320,7 +380,13 @@ def main():
             chunk_input=True,
         )
     else:
-        proc = processor(text=[final_text], return_tensors="pt", add_special_tokens=True)
+        # 无图时关闭 padding，避免自研路径把 pad token 写进 KV
+        proc = processor(
+            text=[final_text],
+            return_tensors="pt",
+            add_special_tokens=True,
+            padding=False,
+        )
     input_ids = proc["input_ids"].to(device)
     attention_mask = proc["attention_mask"].to(device)
     image_bound = proc.get("image_bound", None)
@@ -360,18 +426,13 @@ def main():
         runner = AOTIRunner(args.vision_pt, args.embed_pt, args.llm_pt, device_index=args.device_index, dtype=dtype)
     else:
         if model is None:
-            model = AutoModel.from_pretrained(
-                args.model_path,
-                trust_remote_code=True,
-                torch_dtype=dtype,
-                device_map=device,
-                init_vision=not args.no_vision,
-                init_audio=False,
-                init_tts=False,
-                local_files_only=True,
-            ).eval()
-        custom_model = build_from_hf(model).to(device)
-        runner = WrapperRunner(custom_model, tokenizer)
+            wrapper_adapter = MiniCPMAdapter.from_pretrained(
+                args.model_dir,
+                device=device,
+                dtype=dtype
+            )
+            model = wrapper_adapter.hf_model
+            runner = WrapperRunner(wrapper_adapter,args.vision_pt, args.embed_pt, args.llm_pt, device_index=args.device_index)
 
     # 推理
     vision_tokens = runner.encode_image(pixel_values, tgt_sizes)
@@ -388,9 +449,10 @@ def main():
     print(text_out)
     
     if args.compare_hf:
+    # if True:
         if model is None:
             model = AutoModel.from_pretrained(
-                args.model_path,
+                args.model_dir,
                 trust_remote_code=True,
                 torch_dtype=dtype,
                 device_map=device,
@@ -416,3 +478,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python /root/autodl-tmp/AOTinfer/minicpm/run_minicpmo_hf_demo.py \
+#   --model-dir /root/autodl-tmp/models/MiniCPM_o_2_6 \
+#   --image /root/autodl-tmp/AOTinfer/qwen2_5_vl/test.png \
+#   --device cuda \
+#   --dtype bfloat16 \
+#   --use-aoti \
+#   --compare-hf \
+#   --vision-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_vision_resampler.pt2 \
+#   --embed-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2 \
+#   --llm-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2
+
+# du -h -d1 /tmp /root/.cache /root /root/autodl-tmp | sort -h | tail -n 20
+# du -ah . | sort -rh | head -n 10
+
+# python /root/autodl-tmp/AOTinfer/minicpm/run_minicpmo_hf_demo.py \
+#   --model-dir /root/autodl-tmp/models/MiniCPM_o_2_6 \
+#   --device cuda \
+#   --dtype bfloat16 \
+#   --use-aoti \
+#   --compare-hf \
+#   --no-vision \
+#   --embed-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2 \
+#   --llm-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2

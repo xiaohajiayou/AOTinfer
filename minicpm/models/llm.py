@@ -21,7 +21,7 @@ class MiniCPMDecoder(nn.Module):
         layers: nn.ModuleList,
         norm: nn.Module,
         lm_head: nn.Linear,
-        rotary_emb: ExportRotaryEmbedding,
+        rotary_emb,
         num_kv_heads: int,
         head_dim: int,
     ):
@@ -44,9 +44,15 @@ class MiniCPMDecoder(nn.Module):
         B, N, _ = hidden_states.shape
         device = hidden_states.device
 
-        seq_len = inputs_embeds.shape[1]
-        position_ids = torch.arange(0, seq_len, device=device).view(1, seq_len) + cache_len.unsqueeze(-1)
-        cos, sin = self.rotary(position_ids, seq_len)
+        # position_ids = torch.arange(0, N, device=device).view(1, N) + cache_len.unsqueeze(-1)
+        # cos, sin = self.rotary(position_ids, N)
+        position_ids = torch.arange(0, N, device=device).view(1, N) + cache_len.unsqueeze(-1)
+        cos, sin = self.rotary(position_ids, N, hidden_states.dtype)
+        
+        # position_ids = torch.arange(
+        #     cache_len.item(), cache_len.item() + N, device=device
+        # ).view(1, N)
+        # cos, sin = self.rotary(hidden_states, position_ids)
         new_key = []
         new_value = []
         for i, block in enumerate(self.layers):
@@ -81,11 +87,10 @@ def build_llm_from_hf(hf_llm: nn.Module):
     rope_theta = getattr(cfg, "rope_theta", 10000.0)
     
     lm_head = hf_llm.lm_head
-    embed_tokens = hf_llm.model.embed_tokens
     num_heads = cfg.num_attention_heads
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.hidden_size // num_heads
     rotary = ExportRotaryEmbedding(head_dim, max_position_embeddings=max_pos, base=rope_theta)
+    # rotary = hf_llm.model.layers[0].self_attn.rotary_emb
     decoder = MiniCPMDecoder(layers, norm, lm_head, rotary, num_kv_heads=num_kv_heads, head_dim=head_dim)
-    scale_emb = getattr(cfg, "scale_emb", 1.0)
-    return decoder, embed_tokens, scale_emb
+    return decoder

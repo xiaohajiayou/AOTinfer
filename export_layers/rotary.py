@@ -53,16 +53,30 @@ class ExportRotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, position_ids: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, position_ids: torch.Tensor, seq_len: int, out_dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         position_ids: [B, seq]
         seq_len: 当前序列长度（历史+本步），用于裁剪 cos/sin
         """
 
         # [B, seq, head_dim/2]
-        inv_freq = self.inv_freq.unsqueeze(0).unsqueeze(0)
-        theta = position_ids.float().unsqueeze(-1) * inv_freq
+        # inv_freq = self.inv_freq.to(position_ids.device, dtype=torch.float32)
+        # inv_freq = self.inv_freq.unsqueeze(0).unsqueeze(0)
+        # theta = position_ids.float().unsqueeze(-1) * inv_freq
+        # emb = torch.cat((theta, theta), dim=-1)
+        # cos = emb.cos()
+        # sin = emb.sin()
+        # return cos[:, -seq_len:], sin[:, -seq_len:]
+
+       
+        # position_ids: [B, seq]，seq_len 通常就是 position_ids.shape[1]
+        inv_freq = self.inv_freq.to(position_ids.device, dtype=torch.float32)
+        position = position_ids.to(dtype=torch.float32).unsqueeze(-1)  # [B, seq, 1]
+        inv_freq = inv_freq.unsqueeze(0).unsqueeze(0)                 # [1,1,head_dim/2]
+        theta = position * inv_freq
         emb = torch.cat((theta, theta), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
-        return cos[:, -seq_len:], sin[:, -seq_len:]
+        cos = cos[:, -seq_len:].to(dtype=out_dtype)
+        sin = sin[:, -seq_len:].to(dtype=out_dtype)
+        return cos, sin

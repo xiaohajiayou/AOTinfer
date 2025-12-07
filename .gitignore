@@ -1,1 +1,9 @@
 __pycache__/
+*.pt
+*.pt2
+*.bin
+*.tar.gz
+*.pth
+minicpm/  # 整个模型目录排除
+dataset/  # 数据集目录排除
+*.log

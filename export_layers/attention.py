@@ -62,7 +62,7 @@ class ExportAttention(nn.Module):
 
         bsz, n_step, _ = hidden_states.shape
         dtype = hidden_states.dtype
-
+        hidden_states = hidden_states.to(self.q_proj.weight.dtype)
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)

@@ -19,7 +19,7 @@ import numpy as np
 from transformers import AutoModel, AutoTokenizer, AutoProcessor
 
 from minicpm.preprocess.image_preprocess import preprocess_images
-from minicpm.models.model import build_from_hf
+# from minicpm.models.model import build_from_hf
 from minicpm.models.adapter import scatter_vision_tokens
 
 

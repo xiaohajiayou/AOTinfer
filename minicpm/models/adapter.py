@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import AutoModel, AutoTokenizer
 
-from minicpm.models.model import build_from_hf
+
 from minicpm.models.vision import SiglipVisionExport
 from minicpm.models.resampler import ResamplerExport
 from minicpm.models.llm import build_llm_from_hf
@@ -29,16 +29,7 @@ class VisionResamplerWrapper(nn.Module):
         return self.resampler(hidden, tgt_sizes=tgt_sizes)
 
 
-class MiniCPMEmbed(nn.Module):
-    """纯文本 embedding"""
 
-    def __init__(self, embed_tokens: nn.Embedding, scale_emb: float = 1.0):
-        super().__init__()
-        self.embed_tokens = embed_tokens
-        self.scale_emb = scale_emb
-
-    def forward(self, input_ids: torch.Tensor):
-        return self.embed_tokens(input_ids) * self.scale_emb
 
 
 class MiniCPMAdapter:
@@ -69,6 +60,7 @@ class MiniCPMAdapter:
             trust_remote_code=True,
             torch_dtype=dtype,
             device_map=device,
+            # attn_implementation="eager",
             local_files_only=local_files_only,
             init_vision=True,
             init_audio=False,
@@ -92,11 +84,11 @@ class MiniCPMAdapter:
             self.vision_resampler = VisionResamplerWrapper(vision_export, res_export)
 
         # LLM 与 embedding
-        hf_llm = self.hf_model.llm if hasattr(self.hf_model, "llm") else self.hf_model
-        model, embed_tokens, scale_emb = build_llm_from_hf(hf_llm)
-        self.embed = MiniCPMEmbed(embed_tokens, scale_emb=scale_emb)
-        self.llm = model
-        self.scale_emb = scale_emb
+        if hasattr(self.hf_model, "llm"):
+            hf_llm = self.hf_model.llm 
+            model = build_llm_from_hf(hf_llm)
+            self.embed = hf_llm.model.embed_tokens
+            self.llm = model
 
     def get_export_modules(self):
         """
@@ -114,8 +106,8 @@ class MiniCPMAdapter:
         device: torch.device,
     ):
         device = torch.device(device)
-        if self.llm is None:
-            self.build_submodules()
+        # if self.llm is None:
+        #     self.build_submodules()
         num_layers = len(self.llm.layers)
         num_kv_heads = self.config.num_key_value_heads
         head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -123,10 +115,7 @@ class MiniCPMAdapter:
         for _ in range(num_layers):
             cache.append(
                 torch.zeros(
-                    batch_size,
-                    num_kv_heads,
-                    cache_len,
-                    head_dim,
+                    (batch_size, num_kv_heads, cache_len, head_dim),
                     dtype=dtype,
                     device=device,
                 )
