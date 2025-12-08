@@ -159,7 +159,7 @@ class WrapperRunner(BaseRunner):
     def encode_image(self, pixel_values, tgt_sizes):
         if pixel_values is None:
             return None
-        out = self.vision(pixel_values, tgt_sizes=tgt_sizes)
+        out = self.vision(pixel_values, tgt_sizes)
         return out
 
     @torch.inference_mode()
@@ -322,17 +322,17 @@ def greedy_generate(
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", type=str, default="请描述图片里的内容。")
-    # ap.add_argument("--model-dir", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
-    # ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
-    # ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
-    # ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed_scatter.pt2", help="AOTI embed_scatter pt2 路径")
-    # ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
+    ap.add_argument("--model-dir", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
+    ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
+    ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
+    ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
 
-    ap.add_argument("--model-dir", type=str, default="/root/autodl-tmp/models/MiniCPM_o_2_6")
-    ap.add_argument("--image", type=str, default="/root/autodl-tmp/AOTinfer/qwen2_5_vl/test.png")
-    ap.add_argument("--vision-pt", default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
-    ap.add_argument("--embed-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
-    ap.add_argument("--llm-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
+    # ap.add_argument("--model-dir", type=str, default="/root/autodl-tmp/models/MiniCPM_o_2_6")
+    # ap.add_argument("--image", type=str, default="/root/autodl-tmp/AOTinfer/qwen2_5_vl/test.png")
+    # ap.add_argument("--vision-pt", default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    # ap.add_argument("--embed-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
+    # ap.add_argument("--llm-pt", type=str, default="/root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
 
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="bfloat16")
@@ -419,12 +419,11 @@ def main():
     model = None
     runner = None
 
-        
     # runner 选择：优先 AOTI，其次 wrapper，默认 HF
     if args.use_aoti:
     # if True:
         runner = AOTIRunner(args.vision_pt, args.embed_pt, args.llm_pt, device_index=args.device_index, dtype=dtype)
-    else:
+    elif args.use_wrapper:
         if model is None:
             wrapper_adapter = MiniCPMAdapter.from_pretrained(
                 args.model_dir,
@@ -433,7 +432,20 @@ def main():
             )
             model = wrapper_adapter.hf_model
             runner = WrapperRunner(wrapper_adapter,args.vision_pt, args.embed_pt, args.llm_pt, device_index=args.device_index)
-
+    else:
+        if model is None:
+            model = AutoModel.from_pretrained(
+                args.model_dir,
+                trust_remote_code=True,
+                torch_dtype=dtype,
+                device_map=device,
+                init_vision=not args.no_vision,
+                init_audio=False,
+                init_tts=False,
+                local_files_only=True,
+            ).eval()
+        runner = HFRunner(model, tokenizer)     
+           
     # 推理
     vision_tokens = runner.encode_image(pixel_values, tgt_sizes)
     text_out = greedy_generate(
