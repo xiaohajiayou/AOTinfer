@@ -78,6 +78,7 @@ def scatter_vision_tokens(
     return new_embeds
 
 
+
 class BaseRunner:
     def encode_image(self, pixel_values, tgt_sizes):
         raise NotImplementedError
@@ -218,17 +219,7 @@ class AOTIRunner(BaseRunner):
     """
 
     def __init__(self, vision_path, embed_path, llm_path, device_index: int, dtype: torch.dtype):
-        # 确保 codecache 存在
-        # try:
-        #     import importlib
 
-        #     spec = importlib.util.find_spec("torch._inductor.codecache")
-        #     if spec is not None:
-        #         import torch._inductor.codecache as _cc  # type: ignore
-
-        #         torch._inductor.codecache = _cc  # type: ignore[attr-defined]
-        # except Exception:
-        #     pass
         self.vision = torch._inductor.aoti_load_package(vision_path, device_index=device_index)
         self.embed = torch._inductor.aoti_load_package(embed_path, device_index=device_index)
         self.llm = torch._inductor.aoti_load_package(llm_path, device_index=device_index)
@@ -284,9 +275,6 @@ class AOTIRunner(BaseRunner):
         out = self.llm(inputs_embeds, key_cache, value_cache, cache_len_tensor)
         logits, new_key, new_value, new_cache_len = out
         return logits, new_key, new_value, new_cache_len
-        # flat = flatten_inputs(inputs_embeds, key_cache, value_cache, cache_len)
-        # outputs = self.llm.loader.run(flat)
-        # return unflatten_outputs(outputs, self.num_layers)
 
 
 def greedy_generate(
@@ -324,9 +312,9 @@ def parse_args():
     ap.add_argument("--prompt", type=str, default="请描述图片里的内容。")
     ap.add_argument("--model-dir", type=str, default="/home/liwenxiao/models/minicpm_o_2_6")
     ap.add_argument("--image", type=str, default="/home/liwenxiao/AOTinfer/qwen2_5_vl/test.png")
-    ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
-    ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
-    ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
+    ap.add_argument("--vision-pt", default="/home/liwenxiao/AOTinfer/artifacts/minicpm/minicpm_vision_resampler.pt2", type=str, help="AOTI vision_resampler pt2 路径")
+    ap.add_argument("--embed-pt", type=str, default="/home/liwenxiao/AOTinfer/artifacts/minicpm/minicpm_embed.pt2", help="AOTI embed_scatter pt2 路径")
+    ap.add_argument("--llm-pt", type=str, default="/home/liwenxiao/AOTinfer/artifacts/minicpm/minicpm_llm.pt2", help="AOTI llm pt2 路径")
 
     # ap.add_argument("--model-dir", type=str, default="/root/autodl-tmp/models/MiniCPM_o_2_6")
     # ap.add_argument("--image", type=str, default="/root/autodl-tmp/AOTinfer/qwen2_5_vl/test.png")
@@ -341,7 +329,7 @@ def parse_args():
     ap.add_argument("--use-wrapper", action="store_true", help="使用自研前向 runner；否则默认 HF")
     ap.add_argument("--use-aoti", action="store_true", help="使用aotinductor前向 runner；否则默认 HF")
     ap.add_argument("--compare-hf", action="store_true", help="同时跑 HF runner 对比输出（仅 use-wrapper 时生效）")
-    ap.add_argument("--device-index", type=int, default=-1, help="AOTI 设备索引，GPU 用 0/1，CPU 用 -1")
+    ap.add_argument("--device-index", type=int, default=0, help="AOTI 设备索引，GPU 用 0/1，CPU 用 -1")
     return ap.parse_args()
 
 
@@ -515,3 +503,6 @@ if __name__ == "__main__":
 #   --no-vision \
 #   --embed-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_embed.pt2 \
 #   --llm-pt /root/autodl-tmp/AOTinfer/minicpm/minicpm_llm.pt2
+
+
+# git gc --prune=now --aggressive

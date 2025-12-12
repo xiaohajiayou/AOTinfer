@@ -4,6 +4,10 @@ __pycache__/
 *.bin
 *.tar.gz
 *.pth
-minicpm/  # 整个模型目录排除
-dataset/  # 数据集目录排除
 *.log
+minicpm/*.pt2
+cpp/libtorch/
+cpp/libtorch-*.zip
+cpp/build/
+.hf_modules/
+artifacts/*
