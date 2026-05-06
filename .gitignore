@@ -11,3 +11,5 @@ cpp/libtorch-*.zip
 cpp/build/
 .hf_modules/
 artifacts/*
+cpp/thirdparty/20251114/*.so
+cpp/**/build/

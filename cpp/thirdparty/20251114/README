@@ -1,0 +1,87 @@
+20251114
+1. 支持l2norm sigmod调用
+
+20251106
+1. 支持relu reduce sum调用
+2. 修复了维度大于65536的问题
+
+20251104
+1. 支持rwkv7调用
+2. 优化了cmodel算子速度
+3. 解决了长序列崩溃问题
+
+20251017
+1. 修改了matmul cos/sin bug
+2. rope position param 修改为int32
+
+20250926
+1. 支持timestamp embedding调用
+
+20250912
+1. 支持ffn triu tril调用
+2. 优化op耗时
+3. 删除pitch大于21bit的assert
+
+20250909
+1. 优化matmul和create tensor耗时
+2. matmul 支持Q6
+
+20250829
+1. 支持layer-norm调用
+
+20250827
+1. 支持group-norm调用
+2. 修改rope参数传入
+3. rmsnorm scale可以传入NULL
+
+20250822
+1. 支持rope调用
+2. 优化gather运行耗时
+
+20250819
+1. attention支持scale传入
+2. 优化gather运行耗时
+3. 优化模型生成逻辑
+
+20250815
+1. 支持upsample conv attention调用
+2. 修复matmul_weight_quantbatch结果不对的问题
+3. 修复tanh gelu比对不过的问题
+4. 修复pad在reflect下结果不对的问题
+5. 删除多余打印
+
+20250812
+1. 修复tanh silu gelu gelu_quick exp 调用时崩溃的问题，需要外部获取workspace内存
+2. 修复matmul/matmul_weight_quantbatch非1广播时结果不对的问题
+3. 修复exp的比对不过的问题
+
+20250808
+1. 支持gather concat pad silu gelu gelu_quick exp调用
+2. matmul/matmul_weight_quant支持batch维度非1广播
+3. 修复rmsnorm softmax的报错问题
+4. 删除中间dump数据打印
+
+20250801
+1. 支持rmsnorm reshape permute cast 调用
+2. matmul_weight_quant接口支持q4量化
+3. create_tensor接口支持创建5D(BM1N1M0N0/NC1HWC0)layout格式
+4. DDR内存对齐更改为1字节
+
+20250725
+1. 支持matmul_weight_quant，softmax 调用
+2. 修复div单算子调用报错问题
+
+20250718
+1. 支持add/sub/mul/div单算子调用
+2. 修复matmul fp32输出结果不对问题
+3. 提供matmul add/sub/mul/div的单算子调用sample
+4. 支持test_inference跑code_data_model.bin
+5. 修复内存泄漏问题
+
+20250711
+1. libgkcl_4040.a为 赤水河runtime库
+2. libxmisa_cmodel_pc_4040.so为 NPU的算子库
+3. libxmedia_x86_api_4040.so为 NPU驱动库
+4. include文件夹为赤水河runtime的头文件，重点关注gkcl_common.h, gkcl_op.h gkcl.h
+5. test_context.cpp为简易sample, 目前还有内存泄漏的问题。
+6. 当前libgkcl_4040.a只支持matmul算子。
